@@ -1,0 +1,48 @@
+---
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  publish-release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build-target:
+          - toolchain: stable
+            target: aarch64-unknown-linux-gnu
+          - toolchain: stable
+            target: x86_64-unknown-linux-gnu
+          - toolchain: stable
+            target: x86_64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Install rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.build-target.toolchain }}
+          profile: minimal
+          override: true
+          target: ${{ matrix.build-target.target }}
+      - name: Build Target
+        uses: actions-rs/cargo@v1
+        with:
+          use-cross: true
+          command: build
+          args: --release --bin bimini --target ${{ matrix.build-target.target }}
+      - name: Package
+        run: |-
+          mv target/${{ matrix.build-target.target}}/release/bimini bimini-${{ matrix.build-target.target }}
+      - name: Publish
+        uses: softprops/action-gh-release@v1
+        with:
+          files: 'bimini-*'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
