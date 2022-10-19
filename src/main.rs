@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use bimini::aws_client::{AwsClient, AwsClientBuilder, AwsCredentials};
-use bimini::vault_client::VaultClient;
+use bimini::vault_api::VaultApi;
+
 use clap::Parser as ClapParser;
 use nix::sys::{signal, time, wait};
 use nix::{errno, libc, unistd};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::os::unix::process::CommandExt;
-use std::process;
+use std::{env, process};
 
 #[derive(Debug)]
 struct SignalConfig {
@@ -15,6 +17,9 @@ struct SignalConfig {
     sigttin_action: signal::SigAction,
     sigttou_action: signal::SigAction,
 }
+
+const PKG_NAME: &str = env!("CARGO_PKG_NAME");
+const SIG_TIMED_WAIT_TS: &time::TimeSpec = &time::TimeSpec::new(1, 0);
 
 #[derive(ClapParser, Debug)]
 struct CliArgs {
@@ -92,6 +97,8 @@ struct CliArgs {
 }
 
 fn mask_signals() -> Result<SignalConfig> {
+    tracing::info!("Masking signals");
+
     let protected_signals = vec![
         signal::SIGFPE,
         signal::SIGILL,
@@ -136,6 +143,8 @@ fn mask_signals() -> Result<SignalConfig> {
 }
 
 fn unmask_signals(signal_config: &SignalConfig) -> Result<()> {
+    tracing::info!("Unmasking signals.");
+
     signal::sigprocmask(
         signal::SigmaskHow::SIG_SETMASK,
         Some(&signal_config.source_signals),
@@ -155,6 +164,8 @@ fn unmask_signals(signal_config: &SignalConfig) -> Result<()> {
 }
 
 fn isolate_child() -> Result<()> {
+    tracing::info!("Isolating child process in a new process group.");
+
     let zero_pid = unistd::Pid::from_raw(0);
     if let Err(errno) = unistd::setpgid(zero_pid, zero_pid) {
         tracing::error!("setpgid failed {}", errno.desc());
@@ -177,6 +188,8 @@ fn isolate_child() -> Result<()> {
 }
 
 fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()> {
+    tracing::info!("Switching UID:GID to userspec: {user_spec}");
+
     let user_spec: Vec<&str> = user_spec.split(':').collect();
 
     // // switch gid
@@ -205,7 +218,7 @@ fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()>
                 })?;
 
                 if let Err(errno) = unistd::chdir(&user.dir) {
-                    tracing::error!(
+                    tracing::warn!(
                         "Failed to chdir to user homedir, defaulting to root - {}",
                         errno
                     );
@@ -228,10 +241,43 @@ fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()>
     Ok(())
 }
 
+pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<String, String> {
+    tracing::info!("Resolving Hashicorp Vault keys in ENV.");
+
+    let mut vault_cache =
+        HashMap::<String, Option<bimini::vault_api::engine::kv2::Kv2GetResponse>>::new();
+
+    env.filter(|(_, val)| val.starts_with("vault:"))
+        .map(|(env_key, val)| {
+            (
+                String::from(&env_key), //
+                {
+                    let fields: Vec<&str> = val.split(':').collect();
+                    let (_, engine, path, key) = (fields[0], fields[1], fields[2], fields[3]);
+
+                    let cache_page = vault_cache
+                        .entry(format!("{engine}:{path}"))
+                        .or_insert_with(|| vault_api.kv2_get(engine, path, None).ok());
+
+                    cache_page
+                        .as_ref()
+                        .map(|json| json.data.data.get(key).map(String::from))
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| {
+                            tracing::warn!("Failed to resolve Vault ENV key: {env_key}={val}");
+                            String::from(&val)
+                        })
+                    // cache_page.
+                },
+            )
+        })
+        .collect()
+}
+
 fn spawn(
     signal_config: &SignalConfig,
     aws_client: &Option<AwsClient>,
-    vault_client: &Option<VaultClient>,
+    vault_api: &Option<VaultApi>,
     userspec: Option<String>,
     spawn_directory: Option<String>,
     command: String,
@@ -239,16 +285,17 @@ fn spawn(
 ) -> Result<unistd::Pid> {
     match unsafe { unistd::fork() } {
         Ok(unistd::ForkResult::Child) => {
-            let mut proc = process::Command::new(command);
-            proc.args(args);
+            let mut proc = process::Command::new(&command);
 
-            proc.envs(if let Some(vault_client) = vault_client {
-                vault_client.process_env_map(std::env::vars())
-            } else {
-                std::env::vars().collect()
-            });
+            proc.args(args);
+            proc.envs(env::vars().collect::<HashMap<String, String>>());
+
+            if let Some(vault_api) = vault_api {
+                proc.envs(resolve_vault_env_keys(vault_api, env::vars()));
+            }
 
             if let Some(aws_client) = aws_client {
+                tracing::info!("Injecting AWS credentials into ENV.");
                 proc.envs(aws_client.as_env_map());
             }
 
@@ -260,6 +307,7 @@ fn spawn(
 
             unmask_signals(signal_config)?;
 
+            tracing::info!("Handing execution off to child proc: {command}");
             let error = proc.exec();
 
             tracing::error!("execvp failed: {error}");
@@ -279,6 +327,8 @@ fn spawn(
 }
 
 fn reap_zombies(child_pid: unistd::Pid) -> Result<i32> {
+    tracing::trace!("Reaping zombie procs.");
+
     let any_proc = unistd::Pid::from_raw(-1);
     let mut child_exitcode = -1;
 
@@ -326,8 +376,6 @@ fn reap_zombies(child_pid: unistd::Pid) -> Result<i32> {
     Ok(child_exitcode)
 }
 
-static SIG_TIMED_WAIT_TS: &time::TimeSpec = &time::TimeSpec::new(1, 0);
-
 fn sigtimedwait(parent_signals: &signal::SigSet) -> Result<libc::siginfo_t, errno::Errno> {
     let mut siginfo = std::mem::MaybeUninit::uninit();
     let result = unsafe {
@@ -343,7 +391,8 @@ fn sigtimedwait(parent_signals: &signal::SigSet) -> Result<libc::siginfo_t, errn
 }
 
 fn forward_signals(parent_signals: &signal::SigSet, child_pid: unistd::Pid) -> Result<()> {
-    tracing::info!("In forward signals");
+    tracing::trace!("Forwarding signals from {PKG_NAME} to child proc.");
+
     match sigtimedwait(parent_signals) {
         Err(errno @ errno::Errno::EAGAIN | errno @ errno::Errno::EINTR) => {
             tracing::info!("Expected error, passing: {}", errno.desc());
@@ -395,6 +444,7 @@ fn main() -> Result<process::ExitCode> {
     let aws_credentials = if let (Some(access_key), Some(secret_key)) =
         (cli_args.aws_access_key_id, cli_args.aws_secret_access_key)
     {
+        tracing::info!("Using provided AWS IAM credentials.");
         Some(
             AwsCredentials::new()
                 .access_key_id(access_key)
@@ -405,6 +455,7 @@ fn main() -> Result<process::ExitCode> {
                 .build(),
         )
     } else {
+        tracing::info!("Attempting to fetch AWS IAM credentials from container identity service.");
         AwsCredentials::lookup(
             cli_args.aws_container_credentials_relative_uri,
             cli_args.aws_container_credentials_full_uri,
@@ -412,52 +463,51 @@ fn main() -> Result<process::ExitCode> {
     };
 
     let mut aws_client = match aws_credentials {
-        Some(aws_creds) if !cli_args.aws_client_disabled => Some(
-            AwsClientBuilder::from(aws_creds)
-                .region(
-                    cli_args
-                        .aws_region
-                        .unwrap_or_else(|| String::from("us-east-1")),
-                )
-                .build(),
-        ),
+        Some(aws_creds) if !cli_args.aws_client_disabled => {
+            tracing::info!("Loading AWS IAM credentials from container identity service.");
+            Some(
+                AwsClientBuilder::from(aws_creds)
+                    .region(
+                        cli_args
+                            .aws_region
+                            .unwrap_or_else(|| String::from("us-east-1")),
+                    )
+                    .build(),
+            )
+        }
         _ => None,
     };
 
     // Build Hashicorp Vault client
-    let mut vault_client = if cli_args.vault_client_disabled {
+    let mut vault_api = if cli_args.vault_client_disabled {
         None
     } else {
         tracing::info!("Building Hashicorp Vault client.");
-        Some(
-            VaultClient::new()
-                .addr(cli_args.vault_addr.unwrap_or_else(|| {
-                    tracing::error!("VAULT_ADDR required for vault client integration.");
-                    process::exit(1);
-                }))
-                .security_header(cli_args.vault_security_header.unwrap_or_else(|| {
-                    tracing::error!("VAULT_SECURITY_HEADER required for vault client integration.");
-                    process::exit(1);
-                }))
-                .role(cli_args.vault_role.unwrap_or_else(|| {
-                    tracing::error!("VAULT_ROLE required for vault client integration.");
-                    process::exit(1);
-                }))
-                .token(cli_args.vault_token)
-                .build(),
-        )
+        Some(VaultApi::new(
+            cli_args.vault_addr.unwrap_or_else(|| {
+                tracing::error!("VAULT_ADDR required for vault client integration.");
+                process::exit(1);
+            }),
+            cli_args.vault_security_header,
+            cli_args.vault_token,
+        ))
     };
 
-    (vault_client, aws_client) = match (vault_client, aws_client) {
-        (Some(mut vault_client), Some(aws_client)) => {
-            vault_client.authenticate(&aws_client)?;
-            (Some(vault_client), Some(aws_client))
+    (vault_api, aws_client) = match (vault_api, aws_client) {
+        (Some(mut vault_api), Some(aws_client)) => {
+            if let Some(vault_role) = cli_args.vault_role {
+                vault_api.auth_aws_login(&vault_role, &aws_client)?;
+            } else {
+                tracing::error!("VAULT_ROLE required for vault / aws login.");
+                process::exit(1);
+            }
+            (Some(vault_api), Some(aws_client))
         }
-        (Some(vault_client), None) if vault_client.token.is_none() => {
+        (Some(vault_api), None) if vault_api.token.is_none() => {
             tracing::error!("Either a vault token or AWS credentials are required.");
             process::exit(1);
         }
-        (vault_client, aws_client) => (vault_client, aws_client),
+        (vault_api, aws_client) => (vault_api, aws_client),
     };
 
     // Mask signals
@@ -473,7 +523,7 @@ fn main() -> Result<process::ExitCode> {
     let child_pid = spawn(
         &signal_config,
         &aws_client,
-        &vault_client,
+        &vault_api,
         cli_args.spawn_userspec,
         cli_args.spawn_directory,
         cli_args.command,

@@ -1,3 +1,4 @@
+use crate::BIMINI_USER_AGENT;
 use anyhow::Result;
 use aws_sigv4::http_request;
 use builder_pattern::Builder;
@@ -97,25 +98,32 @@ impl AwsClient {
         ])
     }
 
-    pub fn sts_signed_request_data(&self, server_id: &str) -> Result<HashMap<&str, String>> {
+    pub fn sts_signed_request_data(
+        &self,
+        server_id: Option<&String>,
+    ) -> Result<HashMap<&str, String>> {
         tracing::info!("Constructing sts:GetCallerIdentity request.");
 
         const REQUEST_METHOD: &str = "POST";
         const REQUEST_BODY: &[u8; 43] = b"Action=GetCallerIdentity&Version=2011-06-15";
 
-        let mut request = http::Request::builder()
+        let mut request_builder = http::Request::builder()
             .method(REQUEST_METHOD)
             .uri("https://sts.amazonaws.com")
+            .header(http::header::USER_AGENT, BIMINI_USER_AGENT)
             .header(
                 http::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded;charset=utf-8",
-            )
-            .header("x-vault-aws-iam-server-id", server_id)
-            .body(REQUEST_BODY)
-            .map_err(|error| {
-                tracing::error!("Failed to construct sts:GetCallerIdentity request - {error}");
-                error
-            })?;
+            );
+
+        if let Some(server_id) = server_id {
+            request_builder = request_builder.header("x-vault-aws-iam-server-id", server_id);
+        }
+
+        let mut request = request_builder.body(REQUEST_BODY).map_err(|error| {
+            tracing::error!("Failed to construct sts:GetCallerIdentity request - {error}");
+            error
+        })?;
 
         tracing::info!("Constructing request signing parameters.");
         let mut signing_params_builder = http_request::SigningParams::builder()
