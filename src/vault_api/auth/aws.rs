@@ -22,9 +22,36 @@ pub struct AuthAwsResponse {
 
 impl VaultApi {
     pub fn auth_aws_login(&mut self, role: &str, aws_client: &AwsClient) -> Result<()> {
-        let mut login_data = aws_client.sts_signed_request_data(self.security_header.as_ref())?;
-        login_data.insert("role", String::from(role));
-        login_data.insert("nonce", uuid::Uuid::new_v4().hyphenated().to_string());
+        let headers = self
+            .security_header
+            .as_ref()
+            .map(|sec_header| HashMap::from([("x-vault-aws-iam-server-id", sec_header.as_str())]));
+
+        let signed_request = aws_client
+            .sts_get_caller_identity_signed_request(headers)
+            .map(|req| aws_client.sign_request(req))??;
+
+        let nonce = uuid::Uuid::new_v4().hyphenated().to_string();
+        let iam_request_url = base64::encode(b"https://sts.amazonaws.com");
+        let iam_request_headers = serde_json::to_string(
+            &signed_request
+                .headers()
+                .iter()
+                .map(|(key, val)| (key.as_str(), val.to_str().unwrap_or("")))
+                .collect::<HashMap<&str, &str>>(),
+        )
+        .map(base64::encode)?;
+        let iam_request_body =
+            base64::encode(crate::aws_client::STS_GET_CALLER_IDENTITY_REQUEST_BODY);
+
+        let login_data = HashMap::from([
+            ("role", role),
+            ("nonce", &nonce),
+            ("iam_http_request_method", "POST"),
+            ("iam_request_url", &iam_request_url),
+            ("iam_request_headers", &iam_request_headers),
+            ("iam_request_body", &iam_request_body),
+        ]);
 
         let response = self
             .post("auth/aws/login", &Some(login_data))

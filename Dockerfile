@@ -8,6 +8,8 @@ ARG org_opencontainers_image_revision
 
 FROM rust:bullseye AS cargo-chef
 
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 RUN rustup component add rustfmt
 RUN cargo install cargo-chef
 

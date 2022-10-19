@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use bimini::aws_client::{AwsClient, AwsClientBuilder, AwsCredentials};
+use bimini::aws_client::aws_credentials::AwsCredentials;
+use bimini::aws_client::AwsClient;
 use bimini::vault_api::VaultApi;
 
 use clap::Parser as ClapParser;
@@ -264,7 +265,9 @@ pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<S
                         .map(|json| json.data.data.get(key).map(String::from))
                         .unwrap_or(None)
                         .unwrap_or_else(|| {
-                            tracing::warn!("Failed to resolve Vault ENV key: {env_key}={val}");
+                            tracing::warn!(
+                                "Failed to resolve Vault ENV - Key: {env_key} Value: {val}"
+                            );
                             String::from(&val)
                         })
                     // cache_page.
@@ -296,7 +299,7 @@ fn spawn(
 
             if let Some(aws_client) = aws_client {
                 tracing::info!("Injecting AWS credentials into ENV.");
-                proc.envs(aws_client.as_env_map());
+                proc.envs(aws_client.as_envs());
             }
 
             if let Some(userspec) = userspec {
@@ -440,39 +443,44 @@ fn main() -> Result<process::ExitCode> {
         _ => subscriber_builder.init(),
     };
 
-    // Build AWS Client
-    let aws_credentials = if let (Some(access_key), Some(secret_key)) =
+    let aws_creds = if cli_args.aws_client_disabled {
+        None
+    } else if let (Some(access_key), Some(secret_key)) =
         (cli_args.aws_access_key_id, cli_args.aws_secret_access_key)
     {
         tracing::info!("Using provided AWS IAM credentials.");
         Some(
             AwsCredentials::new()
                 .access_key_id(access_key)
-                .expiration(None)
-                .role_arn(None)
                 .secret_access_key(secret_key)
                 .token(cli_args.aws_session_token)
                 .build(),
         )
-    } else {
-        tracing::info!("Attempting to fetch AWS IAM credentials from container identity service.");
-        AwsCredentials::lookup(
+    } else if cli_args.aws_container_credentials_relative_uri.is_some()
+        || cli_args.aws_container_credentials_full_uri.is_some()
+    {
+        tracing::info!("Loading AWS IAM credentials from container identity service.");
+        if let Some(creds) = AwsCredentials::from_container_credential_env_vars(
             cli_args.aws_container_credentials_relative_uri,
             cli_args.aws_container_credentials_full_uri,
-        )
+        ) {
+            Some(creds?)
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
-    let mut aws_client = match aws_credentials {
-        Some(aws_creds) if !cli_args.aws_client_disabled => {
-            tracing::info!("Loading AWS IAM credentials from container identity service.");
+    let mut aws_client = match aws_creds {
+        Some(aws_creds) => {
+            tracing::info!("Building AWS API Client.");
             Some(
-                AwsClientBuilder::from(aws_creds)
-                    .region(
-                        cli_args
-                            .aws_region
-                            .unwrap_or_else(|| String::from("us-east-1")),
-                    )
-                    .build(),
+                aws_creds.to_client(
+                    cli_args
+                        .aws_region
+                        .unwrap_or_else(|| String::from("us-east-1")),
+                ),
             )
         }
         _ => None,
