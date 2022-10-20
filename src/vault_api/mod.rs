@@ -43,7 +43,8 @@ impl VaultApi {
         let mut request = ureq::request_url(method, &self.api_url(path))
             .timeout(std::time::Duration::from_secs(30))
             .set("user-agent", BIMINI_USER_AGENT)
-            .set("accept", "application/json");
+            .set("accept", "application/json")
+            .set("x-vault-request", "true");
 
         if let Some(security_header) = &self.security_header {
             request = request.set("x-vault-aws-iam-server-id", security_header);
