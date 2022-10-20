@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
-use bimini::aws_client::aws_credentials::AwsCredentials;
-use bimini::aws_client::AwsClient;
+use bimini::aws_client::{aws_credentials::AwsCredentials, AwsClient};
+use bimini::vault_api::engine::{kv2::Kv2GetResponse, pki::PkiIssueRequest};
 use bimini::vault_api::VaultApi;
-
 use clap::Parser as ClapParser;
 use nix::sys::{signal, time, wait};
 use nix::{errno, libc, unistd};
@@ -88,6 +87,26 @@ struct CliArgs {
     #[clap(long, env)]
     vault_token: Option<String>,
 
+    /// Turn off Vault secrets injection.
+    #[clap(
+        long,
+        env = "BIMINI_VAULT_CERT_GENERATION_DISABLED",
+        default_value = "false"
+    )]
+    vault_cert_generation_disabled: bool,
+
+    /// Vault pki engine name
+    #[clap(long, env, default_value = "pki")]
+    vault_cert_engine: String,
+
+    /// Vault pki role name
+    #[clap(long, env)]
+    vault_cert_role: Option<String>,
+
+    /// Vault pki certificate request
+    #[clap(long, env)]
+    vault_cert_request: Option<String>,
+
     /// Program to spawn and track.
     #[clap()]
     command: String,
@@ -98,7 +117,7 @@ struct CliArgs {
 }
 
 fn mask_signals() -> Result<SignalConfig> {
-    tracing::info!("Masking signals");
+    tracing::info!("Masking signals.");
 
     let protected_signals = vec![
         signal::SIGFPE,
@@ -202,7 +221,7 @@ fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()>
                     errno
                 })?;
             }
-            Ok(None) => tracing::warn!("No group named {group_name} found - Not setting GID"),
+            Ok(None) => tracing::warn!("No group named {group_name} found - Not setting GID."),
             Err(errno) => {
                 tracing::error!("Failed to lookup group name: {group_name} - {errno}");
                 return Err(errno.into());
@@ -226,7 +245,7 @@ fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()>
                     unistd::chdir("/")?;
                 }
             }
-            Ok(None) => tracing::warn!("No user named {user_name} found - Not setting UID"),
+            Ok(None) => tracing::warn!("No user named {user_name} found - Not setting UID."),
             Err(errno) => {
                 tracing::error!("Failed to lookup user name: {user_name} - {errno}");
                 return Err(errno.into());
@@ -245,8 +264,7 @@ fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()>
 pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<String, String> {
     tracing::info!("Resolving Hashicorp Vault keys in ENV.");
 
-    let mut vault_cache =
-        HashMap::<String, Option<bimini::vault_api::engine::kv2::Kv2GetResponse>>::new();
+    let mut vault_cache = HashMap::<String, Option<Kv2GetResponse>>::new();
 
     env.filter(|(_, val)| val.starts_with("vault:"))
         .map(|(env_key, val)| {
@@ -365,7 +383,7 @@ fn reap_zombies(child_pid: unistd::Pid) -> Result<i32> {
             Ok(_) => todo!(),
 
             Err(nix::Error::ECHILD) => {
-                tracing::trace!("No child to wait");
+                tracing::trace!("No child to wait.");
                 break;
             }
 
@@ -425,6 +443,55 @@ fn forward_signals(parent_signals: &signal::SigSet, child_pid: unistd::Pid) -> R
             }
         },
     }
+
+    Ok(())
+}
+
+fn generate_cert(vault_api: &VaultApi, engine: &str, role: &str, request_json: &str) -> Result<()> {
+    let request = serde_json::from_str::<PkiIssueRequest>(request_json)?;
+    let response = vault_api.pki_issue(engine, role, &request)?;
+
+    let ssl_path = std::path::Path::new("/opt").join(PKG_NAME).join("ssl");
+    let ssl_private_path = ssl_path.join("private");
+    let ssl_certs_path = ssl_path.join("certs");
+
+    std::fs::create_dir_all(&ssl_path)?;
+    std::fs::create_dir_all(&ssl_private_path)?;
+    std::fs::create_dir_all(&ssl_certs_path)?;
+
+    let key_format = &request
+        .private_key_format
+        .unwrap_or_else(|| String::from("der"));
+    let cert_format = &request.format.unwrap_or_else(|| String::from("pem"));
+
+    tracing::warn!("Creating private key");
+    let mut ssl_private_key_path = ssl_private_path.join("key");
+    ssl_private_key_path.set_extension(&key_format);
+    std::fs::write(
+        &ssl_private_key_path,
+        format!("{}\n", &response.data.private_key),
+    )?;
+
+    tracing::warn!("Creating certificate");
+    let mut ssl_cert_path = ssl_certs_path.join("certificate");
+    ssl_cert_path.set_extension(&cert_format);
+    std::fs::write(&ssl_cert_path, format!("{}\n", &response.data.certificate))?;
+
+    tracing::warn!("Creating issuing-ca");
+    let mut ssl_ca_cert_path = ssl_certs_path.join("issuing-ca");
+    ssl_ca_cert_path.set_extension(&cert_format);
+    std::fs::write(
+        &ssl_ca_cert_path,
+        format!("{}\n", &response.data.certificate),
+    )?;
+
+    tracing::warn!("Creating ca-chain");
+    let mut ssl_ca_chain_path = ssl_certs_path.join("ca-chain");
+    ssl_ca_chain_path.set_extension(&cert_format);
+    std::fs::write(
+        &ssl_ca_chain_path,
+        format!("{}\n", &response.data.ca_chain.join("\n")),
+    )?;
 
     Ok(())
 }
@@ -517,6 +584,25 @@ fn main() -> Result<process::ExitCode> {
         }
         (vault_api, aws_client) => (vault_api, aws_client),
     };
+
+    if !cli_args.vault_cert_generation_disabled {
+        if let (Some(vault_api), Some(role), Some(request_json)) = (
+            &vault_api,
+            cli_args.vault_cert_role,
+            cli_args.vault_cert_request,
+        ) {
+            tracing::info!("Generating client certificates.");
+            if let Err(err) =
+                generate_cert(vault_api, &cli_args.vault_cert_engine, &role, &request_json)
+            {
+                tracing::error!("Failed to generate vault issued certs - {err}");
+                process::exit(1);
+            }
+        } else {
+            tracing::error!("Vault cert generation requires vault credentials and a Cert role.");
+            process::exit(1);
+        }
+    }
 
     // Mask signals
     let signal_config = match mask_signals() {
