@@ -28,8 +28,7 @@ impl AwsCredentials {
         relative_url
             .map(|path| format!("http://{}{}", AWS_CONTAINER_CREDENTIAL_IP, path))
             .or(full_url)
-            .map(|url| url::Url::parse(&url).ok())
-            .unwrap_or(None)
+            .and_then(|url| url::Url::parse(&url).ok())
     }
 
     fn from_container_credential_provider(url: &url::Url) -> Result<AwsCredentials> {

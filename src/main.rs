@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bimini::aws_client::{aws_credentials::AwsCredentials, AwsClient};
+use bimini::user_spec::UserSpec;
 use bimini::vault_api::engine::{kv2::Kv2GetResponse, pki::PkiIssueRequest};
 use bimini::vault_api::VaultApi;
 use clap::Parser as ClapParser;
@@ -8,6 +9,7 @@ use nix::{errno, libc, unistd};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::os::unix::process::CommandExt;
+use std::str::FromStr;
 use std::{env, process};
 
 #[derive(Debug)]
@@ -43,35 +45,35 @@ struct CliArgs {
     #[clap(long, env = "BIMINI_AWS_CLIENT_DISABLED", default_value = "false")]
     aws_client_disabled: bool,
 
-    /// AWS Region for for Vault RBAC auth
+    /// AWS Region for for Hashicorp Vault RBAC auth
     #[clap(long, env)]
     aws_region: Option<String>,
 
-    /// AWS credentials URI for Vault RBAC auth
+    /// AWS credentials URI for Hashicorp Vault RBAC auth
     #[clap(long, env)]
     aws_container_credentials_relative_uri: Option<String>,
 
-    /// AWS credentials URI for Vault RBAC auth
+    /// AWS credentials URI for Hashicorp Vault RBAC auth
     #[clap(long, env)]
     aws_container_credentials_full_uri: Option<String>,
 
-    /// AWS access key for Vault RBAC auth
+    /// AWS access key for Hashicorp Vault RBAC auth
     #[clap(long, env)]
     aws_access_key_id: Option<String>,
 
-    /// AWS secret key for Vault RBAC auth
+    /// AWS secret key for Hashicorp Vault RBAC auth
     #[clap(long, env)]
     aws_secret_access_key: Option<String>,
 
-    /// AWS session token for Vault RPAB auth
+    /// AWS session token for Hashicorp Vault RPAB auth
     #[clap(long, env)]
     aws_session_token: Option<String>,
 
-    /// Turn off Vault secrets injection.
+    /// Turn off Hashicorp Vault secrets injection.
     #[clap(long, env = "BIMINI_VAULT_CLIENT_DISABLED", default_value = "false")]
     vault_client_disabled: bool,
 
-    /// Fully qualified domain of the Vault server
+    /// Fully qualified domain of the Hashicorp Vault server
     #[clap(long, env)]
     vault_addr: Option<String>,
 
@@ -79,15 +81,15 @@ struct CliArgs {
     #[clap(long, env)]
     vault_security_header: Option<String>,
 
-    /// Vault role to authenticate as
+    /// Hashicorp Vault role to authenticate as
     #[clap(long, env)]
     vault_role: Option<String>,
 
-    /// Vault token.
+    /// Hashicorp Vault token.
     #[clap(long, env)]
     vault_token: Option<String>,
 
-    /// Turn off Vault secrets injection.
+    /// Turn off Hashicorp Vault certificates generation.
     #[clap(
         long,
         env = "BIMINI_VAULT_CERT_GENERATION_DISABLED",
@@ -95,15 +97,15 @@ struct CliArgs {
     )]
     vault_cert_generation_disabled: bool,
 
-    /// Vault pki engine name
+    /// Hashicorp Vault pki engine name
     #[clap(long, env, default_value = "pki")]
     vault_cert_engine: String,
 
-    /// Vault pki role name
+    /// Hashicorp Vault pki role name
     #[clap(long, env)]
     vault_cert_role: Option<String>,
 
-    /// Vault pki certificate request
+    /// Hashicorp Vault pki certificate request
     #[clap(long, env)]
     vault_cert_request: Option<String>,
 
@@ -207,58 +209,83 @@ fn isolate_child() -> Result<()> {
     }
 }
 
-fn switch_user(user_spec: String, spawn_directory: Option<String>) -> Result<()> {
-    tracing::info!("Switching UID:GID to userspec: {user_spec}");
+fn cwd_str() -> Result<String, errno::Errno> {
+    unistd::getcwd()
+        .map(|current_directory| {
+            current_directory
+                .into_os_string()
+                .into_string()
+                .expect("Current working directory should be a valid string.")
+        })
+        .map_err(|errno| {
+            tracing::error!("Failed to get current working directory - {errno}");
+            errno
+        })
+}
 
-    let user_spec: Vec<&str> = user_spec.split(':').collect();
+fn switch_user(
+    userspec: String,
+    spawn_directory: Option<String>,
+) -> Result<HashMap<String, String>> {
+    tracing::info!("Switching UID:GID to userspec: {userspec}");
 
-    // // switch gid
-    if let Some(group_name) = user_spec.get(1) {
-        match unistd::Group::from_name(group_name) {
-            Ok(Some(group)) => {
-                unistd::setgid(group.gid).map_err(|errno| {
-                    tracing::error!("Failed to set GID to {} - {errno}", group.gid);
-                    errno
-                })?;
-            }
-            Ok(None) => tracing::warn!("No group named {group_name} found - Not setting GID."),
-            Err(errno) => {
-                tracing::error!("Failed to lookup group name: {group_name} - {errno}");
-                return Err(errno.into());
-            }
-        }
+    let mut user_env = HashMap::<String, String>::new();
+    let UserSpec { user, group } = UserSpec::from_str(&userspec)?;
+
+    if let Some(group) = group {
+        unistd::setgid(group.gid).map_err(|errno| {
+            tracing::error!("Failed to set GID to {} - {errno}", group.gid);
+            errno
+        })?;
+        user_env.insert(String::from("GROUP"), group.name);
     }
 
-    if let Some(user_name) = user_spec.first() {
-        match unistd::User::from_name(user_name) {
-            Ok(Some(user)) => {
-                unistd::setuid(user.uid).map_err(|errno| {
-                    tracing::error!("Failed to set UID to {} - {errno}", user.uid);
-                    errno
-                })?;
+    let mut user_home = None;
+    if let Some(user) = user {
+        unistd::setuid(user.uid).map_err(|errno| {
+            tracing::error!("Failed to set UID to {} - {errno}", user.uid);
+            errno
+        })?;
 
-                if let Err(errno) = unistd::chdir(&user.dir) {
-                    tracing::warn!(
-                        "Failed to chdir to user homedir, defaulting to root - {}",
+        let home = user
+            .dir
+            .into_os_string()
+            .into_string()
+            .expect("Directory should be a valid string.");
+
+        user_env.extend([
+            (String::from("USER"), String::from(&user.name)),
+            (String::from("LOGNAME"), String::from(&user.name)),
+            (String::from("HOME"), home.clone()),
+        ]);
+
+        user_home = Some(home);
+    }
+
+    let initial_working_directory = cwd_str()?;
+
+    vec![spawn_directory, user_home, Some(String::from("/"))]
+        .iter()
+        .find_map(|possible_directory| {
+            possible_directory.as_ref().and_then(|dir| {
+                unistd::chdir::<str>(dir.as_ref())
+                    .map(|_| {
+                        tracing::info!("Working directory changed to {dir}");
+                    })
+                    .map_err(|errno| {
+                        tracing::warn!("Failed to change directory to: {dir} - {errno}");
                         errno
-                    );
-                    unistd::chdir("/")?;
-                }
-            }
-            Ok(None) => tracing::warn!("No user named {user_name} found - Not setting UID."),
-            Err(errno) => {
-                tracing::error!("Failed to lookup user name: {user_name} - {errno}");
-                return Err(errno.into());
-            }
-        }
-    }
+                    })
+                    .ok()
+            })
+        });
 
-    if let Some(spawn_dir) = spawn_directory {
-        tracing::info!("chdir to provided spawn directory: {}", spawn_dir);
-        unistd::chdir(spawn_dir.as_str())?;
-    }
+    user_env.extend([
+        (String::from("PWD"), cwd_str()?),
+        (String::from("OLDPWD"), initial_working_directory),
+    ]);
 
-    Ok(())
+    Ok(user_env)
 }
 
 pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<String, String> {
@@ -280,15 +307,13 @@ pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<S
 
                     cache_page
                         .as_ref()
-                        .map(|json| json.data.data.get(key).map(String::from))
-                        .unwrap_or(None)
+                        .and_then(|json| json.data.data.get(key).map(String::from))
                         .unwrap_or_else(|| {
                             tracing::warn!(
-                                "Failed to resolve Vault ENV - Key: {env_key} Value: {val}"
+                                "Failed to resolve Hashicorp Vault ENV - Key: {env_key} Value: {val}"
                             );
                             String::from(&val)
                         })
-                    // cache_page.
                 },
             )
         })
@@ -321,7 +346,7 @@ fn spawn(
             }
 
             if let Some(userspec) = userspec {
-                switch_user(userspec, spawn_directory)?;
+                proc.envs(switch_user(userspec, spawn_directory)?);
             }
 
             isolate_child()?;
@@ -560,7 +585,7 @@ fn main() -> Result<process::ExitCode> {
         tracing::info!("Building Hashicorp Vault client.");
         Some(VaultApi::new(
             cli_args.vault_addr.unwrap_or_else(|| {
-                tracing::error!("VAULT_ADDR required for vault client integration.");
+                tracing::error!("VAULT_ADDR required for Hashicorp Vault client integration.");
                 process::exit(1);
             }),
             cli_args.vault_security_header,
@@ -599,7 +624,9 @@ fn main() -> Result<process::ExitCode> {
                 process::exit(1);
             }
         } else {
-            tracing::error!("Vault cert generation requires vault credentials and a Cert role.");
+            tracing::error!(
+                "Hashicorp Vault cert generation requires vault credentials and a Cert role."
+            );
             process::exit(1);
         }
     }
