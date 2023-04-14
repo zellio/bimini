@@ -1,4 +1,4 @@
-use crate::vault_api::VaultApi;
+use crate::vault::Client;
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -26,7 +26,7 @@ pub struct Kv2GetResponse {
     pub data: Kv2GetResponseData,
 }
 
-impl VaultApi {
+impl Client {
     pub fn kv2_get(
         &self,
         engine: &str,

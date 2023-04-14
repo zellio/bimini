@@ -1,14 +1,13 @@
-pub mod auth;
-pub mod engine;
-
 use crate::BIMINI_USER_AGENT;
 use anyhow::Result;
+use builder_pattern::Builder;
 use serde::Serialize;
+use std::boxed::Box;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-#[derive(Debug)]
-pub struct VaultApi {
+#[derive(Builder, Debug)]
+pub struct Client {
     /// Hashcorp Vault url.
     pub address: url::Url,
 
@@ -19,21 +18,9 @@ pub struct VaultApi {
     pub token: Option<String>,
 }
 
-impl VaultApi {
-    pub fn new(
-        address: String,
-        security_header: Option<String>,
-        token: Option<String>,
-    ) -> VaultApi {
-        VaultApi {
-            address: url::Url::parse(&address).expect("Invalid value for VAULT_ADDR"),
-            security_header,
-            token,
-        }
-    }
-
+impl Client {
     pub fn api_url(&self, path: &str) -> url::Url {
-        let path = format!("/v1/{}", path);
+        let path = format!("/v1/{path}");
         let mut url = self.address.clone();
         url.set_path(&path);
         url
@@ -61,13 +48,13 @@ impl VaultApi {
         &self,
         path: &str,
         data: &Option<impl Serialize + Debug>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<ureq::Response, Box<ureq::Error>> {
         let request = self.request("POST", path);
 
         if let Some(data) = data {
-            request.send_json(data)
+            request.send_json(data).map_err(Box::new)
         } else {
-            request.call()
+            request.call().map_err(Box::new)
         }
     }
 
@@ -75,15 +62,15 @@ impl VaultApi {
         &self,
         path: &str,
         params: &Option<HashMap<String, String>>,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<ureq::Response, Box<ureq::Error>> {
         let mut request = self.request("GET", path);
 
         if let Some(params) = params {
-            for (key, value) in params.into_iter() {
+            for (key, value) in params.iter() {
                 request = request.query(key, value);
             }
         }
 
-        request.call()
+        request.call().map_err(Box::new)
     }
 }

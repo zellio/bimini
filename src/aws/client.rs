@@ -1,20 +1,19 @@
-pub mod aws_credentials;
-
+use crate::aws::Credentials;
 use crate::BIMINI_USER_AGENT;
-
 use anyhow::Result;
 use aws_sigv4::http_request;
 use builder_pattern::Builder;
 use std::collections::HashMap;
 use std::time;
 
-const AWS_CONTAINER_CREDENTIAL_IP: &str = "169.254.170.2";
 pub const STS_GET_CALLER_IDENTITY_REQUEST_BODY: &[u8; 43] =
     b"Action=GetCallerIdentity&Version=2011-06-15";
 
 #[derive(Builder, Debug)]
-pub struct AwsClient {
-    pub region: String,
+pub struct Client {
+    #[default(None)]
+    pub region: Option<String>,
+
     pub access_key_id: String,
     pub secret_access_key: String,
 
@@ -22,7 +21,22 @@ pub struct AwsClient {
     pub session_token: Option<String>,
 }
 
-impl AwsClient {
+impl From<Credentials> for Client {
+    fn from(credentials: Credentials) -> Self {
+        Client {
+            region: None,
+            access_key_id: credentials.access_key_id,
+            secret_access_key: credentials.secret_access_key,
+            session_token: credentials.token,
+        }
+    }
+}
+
+impl Client {
+    pub fn region(&mut self, region: String) {
+        self.region = Some(region);
+    }
+
     pub fn sts_get_caller_identity_signed_request(
         &self,
         headers: Option<HashMap<&str, &str>>,
@@ -59,7 +73,7 @@ impl AwsClient {
         mut request: http::Request<T>,
     ) -> Result<http::Request<T>> {
         let mut signing_params_builder = http_request::SigningParams::builder()
-            .region(&self.region)
+            .region(self.region.as_ref().unwrap())
             .access_key(&self.access_key_id)
             .secret_key(&self.secret_access_key)
             .service_name("sts")
@@ -88,7 +102,7 @@ impl AwsClient {
 
     pub fn as_envs(&self) -> HashMap<&str, &str> {
         let mut envs = HashMap::from([
-            ("AWS_REGION", self.region.as_str()),
+            ("AWS_REGION", self.region.as_ref().unwrap().as_str()),
             ("AWS_ACCESS_KEY_ID", self.access_key_id.as_str()),
             ("AWS_SECRET_ACCESS_KEY", self.secret_access_key.as_str()),
         ]);

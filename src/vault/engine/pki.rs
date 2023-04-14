@@ -1,4 +1,4 @@
-use crate::vault_api::VaultApi;
+use crate::vault::Client;
 use anyhow::Result;
 use builder_pattern::Builder;
 
@@ -105,14 +105,14 @@ pub struct PkiIssueResponse {
     pub warnings: Option<String>,
 }
 
-impl VaultApi {
+impl Client {
     pub fn pki_issue(
         &self,
         engine: &str,
         role: &str,
         request: &PkiIssueRequest,
     ) -> Result<PkiIssueResponse> {
-        let path = format!("{}/issue/{}", engine, role);
+        let path = format!("{engine}/issue/{role}");
         self.post(&path, &Some(request))?
             .into_json()
             .map_err(|err| err.into())

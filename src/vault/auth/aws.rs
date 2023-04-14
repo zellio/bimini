@@ -1,5 +1,7 @@
-use crate::aws_client::AwsClient;
-use crate::vault_api::VaultApi;
+use crate::aws::client::STS_GET_CALLER_IDENTITY_REQUEST_BODY;
+use crate::aws::Client as AwsClient;
+use crate::vault::Client as VaultClient;
+
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -20,7 +22,7 @@ pub struct AuthAwsResponse {
     pub auth: AuthAwsResponseAuth,
 }
 
-impl VaultApi {
+impl VaultClient {
     pub fn auth_aws_login(&mut self, role: &str, aws_client: &AwsClient) -> Result<()> {
         let headers = self
             .security_header
@@ -41,8 +43,7 @@ impl VaultApi {
                 .collect::<HashMap<&str, &str>>(),
         )
         .map(base64::encode)?;
-        let iam_request_body =
-            base64::encode(crate::aws_client::STS_GET_CALLER_IDENTITY_REQUEST_BODY);
+        let iam_request_body = base64::encode(STS_GET_CALLER_IDENTITY_REQUEST_BODY);
 
         let login_data = HashMap::from([
             ("role", role),

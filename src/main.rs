@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use bimini::aws_client::{aws_credentials::AwsCredentials, AwsClient};
-use bimini::user_spec::UserSpec;
-use bimini::vault_api::engine::{kv2::Kv2GetResponse, pki::PkiIssueRequest};
-use bimini::vault_api::VaultApi;
+use bimini::aws::{Client as AwsClient, Credentials as AwsCredentials};
+use bimini::vault::engine::{kv2::Kv2GetResponse, pki::PkiIssueRequest};
+use bimini::vault::Client as VaultClient;
+use bimini::{SpawnDirectory, UserSpec};
 use clap::Parser as ClapParser;
 use nix::sys::{signal, time, wait};
 use nix::{errno, libc, unistd};
@@ -209,91 +209,13 @@ fn isolate_child() -> Result<()> {
     }
 }
 
-fn cwd_str() -> Result<String, errno::Errno> {
-    unistd::getcwd()
-        .map(|current_directory| {
-            current_directory
-                .into_os_string()
-                .into_string()
-                .expect("Current working directory should be a valid string.")
-        })
-        .map_err(|errno| {
-            tracing::error!("Failed to get current working directory - {errno}");
-            errno
-        })
-}
-
-fn switch_user(
-    userspec: String,
-    spawn_directory: Option<String>,
-) -> Result<HashMap<String, String>> {
-    tracing::info!("Switching UID:GID to userspec: {userspec}");
-
-    let mut user_env = HashMap::<String, String>::new();
-    let UserSpec { user, group } = UserSpec::from_str(&userspec)?;
-
-    if let Some(group) = group {
-        unistd::setgid(group.gid).map_err(|errno| {
-            tracing::error!("Failed to set GID to {} - {errno}", group.gid);
-            errno
-        })?;
-        user_env.insert(String::from("GROUP"), group.name);
-    }
-
-    let mut user_home = None;
-    if let Some(user) = user {
-        unistd::setuid(user.uid).map_err(|errno| {
-            tracing::error!("Failed to set UID to {} - {errno}", user.uid);
-            errno
-        })?;
-
-        let home = user
-            .dir
-            .into_os_string()
-            .into_string()
-            .expect("Directory should be a valid string.");
-
-        user_env.extend([
-            (String::from("USER"), String::from(&user.name)),
-            (String::from("LOGNAME"), String::from(&user.name)),
-            (String::from("HOME"), home.clone()),
-        ]);
-
-        user_home = Some(home);
-    }
-
-    let initial_working_directory = cwd_str()?;
-
-    vec![spawn_directory, user_home, Some(String::from("/"))]
-        .iter()
-        .find_map(|possible_directory| {
-            possible_directory.as_ref().and_then(|dir| {
-                unistd::chdir::<str>(dir.as_ref())
-                    .map(|_| {
-                        tracing::info!("Working directory changed to {dir}");
-                    })
-                    .map_err(|errno| {
-                        tracing::warn!("Failed to change directory to: {dir} - {errno}");
-                        errno
-                    })
-                    .ok()
-            })
-        });
-
-    user_env.extend([
-        (String::from("PWD"), cwd_str()?),
-        (String::from("OLDPWD"), initial_working_directory),
-    ]);
-
-    Ok(user_env)
-}
-
-pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<String, String> {
-    tracing::info!("Resolving Hashicorp Vault keys in ENV.");
-
+pub fn resolve_vault_env_keys(
+    vault_client: &VaultClient,
+    env: env::Vars,
+) -> HashMap<String, String> {
     let mut vault_cache = HashMap::<String, Option<Kv2GetResponse>>::new();
 
-    env.filter(|(_, val)| val.starts_with("vault:"))
+    env.filter(|(_, val)| val.starts_with("vault:") && val.matches(':').count() == 3)
         .map(|(env_key, val)| {
             (
                 String::from(&env_key), //
@@ -303,7 +225,7 @@ pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<S
 
                     let cache_page = vault_cache
                         .entry(format!("{engine}:{path}"))
-                        .or_insert_with(|| vault_api.kv2_get(engine, path, None).ok());
+                        .or_insert_with(|| vault_client.kv2_get(engine, path, None).ok());
 
                     cache_page
                         .as_ref()
@@ -323,7 +245,7 @@ pub fn resolve_vault_env_keys(vault_api: &VaultApi, env: env::Vars) -> HashMap<S
 fn spawn(
     signal_config: &SignalConfig,
     aws_client: &Option<AwsClient>,
-    vault_api: &Option<VaultApi>,
+    vault_client: &Option<VaultClient>,
     userspec: Option<String>,
     spawn_directory: Option<String>,
     command: String,
@@ -336,8 +258,9 @@ fn spawn(
             proc.args(args);
             proc.envs(env::vars().collect::<HashMap<String, String>>());
 
-            if let Some(vault_api) = vault_api {
-                proc.envs(resolve_vault_env_keys(vault_api, env::vars()));
+            if let Some(vault_client) = vault_client {
+                tracing::info!("Resolving Hashicorp Vault keys in ENV.");
+                proc.envs(resolve_vault_env_keys(vault_client, env::vars()));
             }
 
             if let Some(aws_client) = aws_client {
@@ -345,9 +268,17 @@ fn spawn(
                 proc.envs(aws_client.as_envs());
             }
 
-            if let Some(userspec) = userspec {
-                proc.envs(switch_user(userspec, spawn_directory)?);
-            }
+            let user_spec = userspec
+                .map(|s| UserSpec::from_str(&s))
+                .transpose()?
+                .unwrap_or_default();
+
+            tracing::info!("Switching execution context UID:GID to {user_spec}");
+            proc.envs(user_spec.switch_user()?);
+
+            tracing::info!("Switching current working directory.");
+            let spawn_directory = SpawnDirectory::new(spawn_directory)?;
+            proc.envs(spawn_directory.switch_directory()?);
 
             isolate_child()?;
 
@@ -472,9 +403,14 @@ fn forward_signals(parent_signals: &signal::SigSet, child_pid: unistd::Pid) -> R
     Ok(())
 }
 
-fn generate_cert(vault_api: &VaultApi, engine: &str, role: &str, request_json: &str) -> Result<()> {
+fn generate_cert(
+    vault_client: &VaultClient,
+    engine: &str,
+    role: &str,
+    request_json: &str,
+) -> Result<()> {
     let request = serde_json::from_str::<PkiIssueRequest>(request_json)?;
-    let response = vault_api.pki_issue(engine, role, &request)?;
+    let response = vault_client.pki_issue(engine, role, &request)?;
 
     let ssl_path = std::path::Path::new("/opt").join(PKG_NAME).join("ssl");
     let ssl_private_path = ssl_path.join("private");
@@ -567,59 +503,72 @@ fn main() -> Result<process::ExitCode> {
     let mut aws_client = match aws_creds {
         Some(aws_creds) => {
             tracing::info!("Building AWS API Client.");
-            Some(
-                aws_creds.to_client(
-                    cli_args
-                        .aws_region
-                        .unwrap_or_else(|| String::from("us-east-1")),
-                ),
-            )
+
+            let mut aws_client = AwsClient::from(aws_creds);
+            aws_client.region(
+                cli_args
+                    .aws_region
+                    .unwrap_or_else(|| String::from("us-east-1")),
+            );
+            Some(aws_client)
         }
         _ => None,
     };
 
     // Build Hashicorp Vault client
-    let mut vault_api = if cli_args.vault_client_disabled {
+    let mut vault_client = if cli_args.vault_client_disabled {
         None
     } else {
         tracing::info!("Building Hashicorp Vault client.");
-        Some(VaultApi::new(
-            cli_args.vault_addr.unwrap_or_else(|| {
-                tracing::error!("VAULT_ADDR required for Hashicorp Vault client integration.");
-                process::exit(1);
-            }),
-            cli_args.vault_security_header,
-            cli_args.vault_token,
-        ))
+
+        let vault_addr = url::Url::parse(&cli_args.vault_addr.unwrap_or_else(|| {
+            tracing::error!("VAULT_ADDR required for Hashicorp Vault client integration.");
+            process::exit(1);
+        }))
+        .map_err(|parse_error| {
+            tracing::error!("VAULT_ADDR has an invalid value - {parse_error}");
+            parse_error
+        })?;
+
+        Some(
+            VaultClient::new()
+                .address(vault_addr)
+                .security_header(cli_args.vault_security_header)
+                .token(cli_args.vault_token)
+                .build(),
+        )
     };
 
-    (vault_api, aws_client) = match (vault_api, aws_client) {
-        (Some(mut vault_api), Some(aws_client)) => {
+    (vault_client, aws_client) = match (vault_client, aws_client) {
+        (Some(mut vault_client), Some(aws_client)) => {
             if let Some(vault_role) = cli_args.vault_role {
-                vault_api.auth_aws_login(&vault_role, &aws_client)?;
+                vault_client.auth_aws_login(&vault_role, &aws_client)?;
             } else {
                 tracing::error!("VAULT_ROLE required for vault / aws login.");
                 process::exit(1);
             }
-            (Some(vault_api), Some(aws_client))
+            (Some(vault_client), Some(aws_client))
         }
-        (Some(vault_api), None) if vault_api.token.is_none() => {
+        (Some(vault_client), None) if vault_client.token.is_none() => {
             tracing::error!("Either a vault token or AWS credentials are required.");
             process::exit(1);
         }
-        (vault_api, aws_client) => (vault_api, aws_client),
+        (vault_client, aws_client) => (vault_client, aws_client),
     };
 
     if !cli_args.vault_cert_generation_disabled {
-        if let (Some(vault_api), Some(role), Some(request_json)) = (
-            &vault_api,
+        if let (Some(vault_client), Some(role), Some(request_json)) = (
+            &vault_client,
             cli_args.vault_cert_role,
             cli_args.vault_cert_request,
         ) {
             tracing::info!("Generating client certificates.");
-            if let Err(err) =
-                generate_cert(vault_api, &cli_args.vault_cert_engine, &role, &request_json)
-            {
+            if let Err(err) = generate_cert(
+                vault_client,
+                &cli_args.vault_cert_engine,
+                &role,
+                &request_json,
+            ) {
                 tracing::error!("Failed to generate vault issued certs - {err}");
                 process::exit(1);
             }
@@ -644,7 +593,7 @@ fn main() -> Result<process::ExitCode> {
     let child_pid = spawn(
         &signal_config,
         &aws_client,
-        &vault_api,
+        &vault_client,
         cli_args.spawn_userspec,
         cli_args.spawn_directory,
         cli_args.command,
