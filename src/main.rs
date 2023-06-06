@@ -69,6 +69,14 @@ struct CliArgs {
     #[clap(long, env)]
     aws_session_token: Option<String>,
 
+    /// Inject AWS Credentials into spawn environment
+    #[clap(
+        long,
+        env = "BIMINI_AWS_CREDENTIALS_ENV_INJECTION_DISABLED",
+        default_value = "false"
+    )]
+    aws_credentials_env_injection_disabled: bool,
+
     /// Turn off Hashicorp Vault secrets injection.
     #[clap(long, env = "BIMINI_VAULT_CLIENT_DISABLED", default_value = "false")]
     vault_client_disabled: bool,
@@ -245,6 +253,7 @@ pub fn resolve_vault_env_keys(
 fn spawn(
     signal_config: &SignalConfig,
     aws_client: &Option<AwsClient>,
+    aws_credentials_env_injection_disabled: bool,
     vault_client: &Option<VaultClient>,
     userspec: Option<String>,
     spawn_directory: Option<String>,
@@ -263,7 +272,8 @@ fn spawn(
                 proc.envs(resolve_vault_env_keys(vault_client, env::vars()));
             }
 
-            if let Some(aws_client) = aws_client {
+            if let (false, Some(aws_client)) = (aws_credentials_env_injection_disabled, aws_client)
+            {
                 tracing::info!("Injecting AWS credentials into ENV.");
                 proc.envs(aws_client.as_envs());
             }
@@ -593,6 +603,7 @@ fn main() -> Result<process::ExitCode> {
     let child_pid = spawn(
         &signal_config,
         &aws_client,
+        cli_args.aws_credentials_env_injection_disabled,
         &vault_client,
         cli_args.spawn_userspec,
         cli_args.spawn_directory,
