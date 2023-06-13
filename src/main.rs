@@ -297,7 +297,11 @@ fn spawn(
             tracing::info!("Handing execution off to child proc: {command}");
             let error = proc.exec();
 
-            tracing::error!("execvp failed: {error}");
+            tracing::error!("execvp of '{command}' failed: {error}");
+            if let Some(errno) = error.raw_os_error() {
+                process::exit(errno);
+            }
+
             Err(error.into())
         }
 
@@ -327,9 +331,8 @@ fn reap_zombies(child_pid: unistd::Pid) -> Result<i32> {
             }
 
             Ok(wait::WaitStatus::Exited(pid, status)) if pid == child_pid => {
-                let exit_status = libc::WEXITSTATUS(status);
-                tracing::info!("Main child exited normally with status: {exit_status}");
-                child_exitcode = exit_status;
+                tracing::info!("Main child exited normally with status: {status}");
+                child_exitcode = status;
             }
 
             Ok(wait::WaitStatus::Signaled(pid, signal, _)) if pid == child_pid => {
