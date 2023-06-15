@@ -1,3 +1,4 @@
+use crate::all_groups::AllGroups;
 use anyhow::Result;
 use builder_pattern::Builder;
 use nix::{errno, unistd};
@@ -50,24 +51,81 @@ impl UserSpec {
         })
     }
 
-    pub fn switch_user(
-        &self, /*, spawn_directory: Option<String>*/
+    fn set_identity(
+        &self,
+        user: &Option<unistd::User>,
+        group: &Option<unistd::Group>,
+        groups: &Option<Vec<unistd::Group>>,
     ) -> Result<HashMap<String, String>> {
-        if let Some(group) = &self.group {
+        if let Some(group) = group {
             unistd::setgid(group.gid).map_err(|errno| {
                 tracing::error!("Failed to set GID to {} - {errno}", group.gid);
                 errno
             })?;
         }
 
-        if let Some(user) = &self.user {
-            unistd::setuid(user.uid).map_err(|errno| {
-                tracing::error!("Failed to set UID to {} - {errno}", user.uid);
+        if let Some(groups) = groups {
+            let gids: &[unistd::Gid] = &groups
+                .iter()
+                .map(|group| group.gid)
+                .collect::<Vec<unistd::Gid>>()[..];
+
+            unistd::setgroups(gids).map_err(|errno| {
+                tracing::error!(
+                    "Failed to set supplemental groups to {:?} - {errno}",
+                    groups
+                );
                 errno
             })?;
         }
 
-        Ok(self.as_env())
+        if let Some(user) = user {
+            unistd::setuid(user.uid).map_err(|errno| {
+                tracing::error!("Failed to set UID to {} - {errno}", user.uid);
+                errno
+            })?;
+            Ok(self.as_env())
+        } else {
+            Ok(HashMap::new())
+        }
+    }
+
+    pub fn switch_user(&self) -> Result<HashMap<String, String>> {
+        match self {
+            UserSpec {
+                user: Some(_),
+                group: Some(_),
+            } => self.set_identity(&self.user, &self.group, &None),
+
+            UserSpec {
+                user: Some(user),
+                group: None,
+            } => {
+                let group = unistd::Group::from_gid(user.gid).ok().flatten();
+                self.set_identity(
+                    &self.user,
+                    &group,
+                    &Some(
+                        AllGroups
+                            .filter_map(|group_result| match group_result {
+                                Ok(group) if group.mem.contains(&user.name) => Some(group),
+                                _ => None,
+                            })
+                            .collect::<Vec<unistd::Group>>(),
+                    ),
+                )
+            }
+
+            UserSpec {
+                user: None,
+                group: Some(_),
+            } => self.set_identity(&None, &self.group, &None),
+
+            UserSpec {
+                user: None,
+                group: None,
+            } => Ok(HashMap::new()),
+        }
     }
 }
 

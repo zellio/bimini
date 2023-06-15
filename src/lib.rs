@@ -8,3 +8,6 @@ pub use user_spec::{UserSpec, UserSpecError};
 
 mod spawn_directory;
 pub use spawn_directory::SpawnDirectory;
+
+pub mod all_groups;
+pub use all_groups::AllGroups;
