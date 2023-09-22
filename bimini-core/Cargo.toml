@@ -1,0 +1,19 @@
+[package]
+name = "bimini-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aws-sigv4 = "0.56.1"
+base64 = "0.21.4"
+bimini-macros = { path = "../bimini-macros" }
+derive_builder = { version = "0.12.0", features = ["clippy"] }
+http = "0.2.9"
+libc = "0.2.148"
+nix = { version = "0.27.1", features = ["user", "fs", "signal", "process", "term"] }
+serde = { version = "1.0.188", features = ["serde_derive"] }
+serde_json = "1.0.107"
+tracing = "0.1.37"
+ureq = { version = "2.7.1", features = ["json"] }
+url = "2.4.1"
+uuid = { version = "1.4.1", features = ["v4"] }

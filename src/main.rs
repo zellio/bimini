@@ -1,29 +1,19 @@
-use anyhow::{Context, Result};
-use bimini::aws::{Client as AwsClient, Credentials as AwsCredentials};
-use bimini::vault::engine::{kv2::Kv2GetResponse, pki::PkiIssueRequest};
-use bimini::vault::Client as VaultClient;
-use bimini::{SpawnDirectory, UserSpec};
-use clap::Parser as ClapParser;
-use nix::sys::{signal, time, wait};
-use nix::{errno, libc, unistd};
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::os::unix::process::CommandExt;
-use std::str::FromStr;
-use std::{env, process};
+use bimini_core::{
+    aws::{self, AwsClient, Client as AwsClientTrait},
+    error::{BiminiError, BiminiResult},
+    nix::UserSpec,
+    proc,
+    vault::{
+        self,
+        engine::{auth::AwsIamAuthEngine, PkiEngine, PkiIssueRequest},
+        Client as VaultClientTrait, VaultClient,
+    },
+};
+use clap::Parser;
+use std::{process, str::FromStr};
+use tracing_subscriber::prelude::*;
 
-#[derive(Debug)]
-struct SignalConfig {
-    parent_signals: signal::SigSet,
-    source_signals: signal::SigSet,
-    sigttin_action: signal::SigAction,
-    sigttou_action: signal::SigAction,
-}
-
-const PKG_NAME: &str = env!("CARGO_PKG_NAME");
-const SIG_TIMED_WAIT_TS: &time::TimeSpec = &time::TimeSpec::new(1, 0);
-
-#[derive(ClapParser, Debug)]
+#[derive(clap::Parser, Debug)]
 struct CliArgs {
     /// Log level (off|error|warn|info|debug|trace).
     #[clap(long, default_value = "info", env = "BIMINI_LOG_LEVEL")]
@@ -41,9 +31,9 @@ struct CliArgs {
     #[clap(long = "spawn-directory", env = "BIMINI_SPAWN_DIRECTORY")]
     spawn_directory: Option<String>,
 
-    /// Turn off AWS credentials management management.
-    #[clap(long, env = "BIMINI_AWS_CLIENT_DISABLED", default_value = "false")]
-    aws_client_disabled: bool,
+    /// Turn on AWS credentials management management.
+    #[clap(long, env = "BIMINI_AWS_CLIENT_ENABLED", default_value = "false")]
+    aws_client_enabled: bool,
 
     /// AWS Region for for Hashicorp Vault RBAC auth
     #[clap(long, env)]
@@ -55,7 +45,7 @@ struct CliArgs {
 
     /// AWS credentials URI for Hashicorp Vault RBAC auth
     #[clap(long, env)]
-    aws_container_credentials_full_uri: Option<String>,
+    aws_container_credentials_full_uri: Option<url::Url>,
 
     /// AWS access key for Hashicorp Vault RBAC auth
     #[clap(long, env)]
@@ -72,38 +62,66 @@ struct CliArgs {
     /// Inject AWS Credentials into spawn environment
     #[clap(
         long,
-        env = "BIMINI_AWS_CREDENTIALS_ENV_INJECTION_DISABLED",
+        env = "BIMINI_AWS_CREDENTIALS_ENV_INJECTION_ENABLED",
         default_value = "false"
     )]
-    aws_credentials_env_injection_disabled: bool,
+    aws_credentials_env_injection_enabled: bool,
 
     /// Turn off Hashicorp Vault secrets injection.
-    #[clap(long, env = "BIMINI_VAULT_CLIENT_DISABLED", default_value = "false")]
-    vault_client_disabled: bool,
+    #[clap(long, env = "BIMINI_VAULT_CLIENT_ENABLED", default_value = "false")]
+    vault_client_enabled: bool,
 
     /// Fully qualified domain of the Hashicorp Vault server
     #[clap(long, env)]
-    vault_addr: Option<String>,
+    vault_addr: Option<url::Url>,
+
+    /// Vault authentication token. Conceptually similar to a session token on
+    /// a website, the VAULT_TOKEN environment variable holds the contents of
+    /// the token. For more information, please see the token concepts page.
+    #[clap(long, env)]
+    vault_token: Option<String>,
+
+    /// Vault authentication role.
+    #[clap(long, env)]
+    vault_role: Option<String>,
+
+    /// Path to a PEM-encoded CA certificate file on the local disk. This file
+    /// is used to verify the Vault server's SSL certificate. This environment
+    /// variable takes precedence over VAULT_CAPATH.
+    #[clap(long, env)]
+    vault_cacert: Option<String>,
+
+    /// Path to a directory of PEM-encoded CA certificate files on the local
+    /// disk. These certificates are used to verify the Vault server's SSL
+    /// certificate.
+    #[clap(long, env)]
+    vault_capath: Option<String>,
+
+    /// Path to a PEM-encoded client certificate on the local disk. This file
+    /// is used for TLS communication with the Vault server.
+    #[clap(long, env)]
+    vault_client_cert: Option<String>,
+
+    /// Path to an unencrypted, PEM-encoded private key on disk which
+    /// corresponds to the matching client certificate.
+    #[clap(long, env)]
+    vault_client_key: Option<String>,
+
+    /// Vault API timeout variable. The default value is 60s.
+    #[clap(long, env, default_value = "60")]
+    vault_client_timeout: Option<u64>,
 
     /// X-Vault-AWS-IAM-Server-ID value
     #[clap(long, env)]
     vault_security_header: Option<String>,
 
-    /// Hashicorp Vault role to authenticate as
-    #[clap(long, env)]
-    vault_role: Option<String>,
-
-    /// Hashicorp Vault token.
-    #[clap(long, env)]
-    vault_token: Option<String>,
-
     /// Turn off Hashicorp Vault certificates generation.
     #[clap(
         long,
-        env = "BIMINI_VAULT_CERT_GENERATION_DISABLED",
+        env = "BIMINI_VAULT_CERT_GENERATION_ENABLED",
         default_value = "false"
     )]
-    vault_cert_generation_disabled: bool,
+    vault_cert_generation_enabled: bool,
 
     /// Hashicorp Vault pki engine name
     #[clap(long, env, default_value = "pki")]
@@ -126,502 +144,166 @@ struct CliArgs {
     args: Vec<String>,
 }
 
-fn mask_signals() -> Result<SignalConfig> {
-    tracing::info!("Masking signals.");
-
-    let protected_signals = vec![
-        signal::SIGFPE,
-        signal::SIGILL,
-        signal::SIGSEGV,
-        signal::SIGBUS,
-        signal::SIGABRT,
-        signal::SIGTRAP,
-        signal::SIGSYS,
-        signal::SIGTTIN,
-        signal::SIGTTOU,
-    ];
-
-    let mut parent_signals = signal::SigSet::all();
-    for signal in protected_signals {
-        parent_signals.remove(signal)
-    }
-
-    let mut source_signals = signal::SigSet::empty();
-    signal::sigprocmask(
-        signal::SigmaskHow::SIG_SETMASK,
-        Some(&parent_signals),
-        Some(&mut source_signals),
-    )?;
-
-    let ignore_action = signal::SigAction::new(
-        signal::SigHandler::SigIgn,
-        signal::SaFlags::empty(),
-        signal::SigSet::empty(),
-    );
-
-    unsafe {
-        let sigttin_action = signal::sigaction(signal::SIGTTIN, &ignore_action)?;
-        let sigttou_action = signal::sigaction(signal::SIGTTOU, &ignore_action)?;
-
-        Ok(SignalConfig {
-            parent_signals,
-            source_signals,
-            sigttin_action,
-            sigttou_action,
-        })
+#[tracing::instrument(skip_all)]
+fn find_aws_credentials(cli_args: &CliArgs) -> BiminiResult<Option<aws::Credentials>> {
+    if let Some(ref path) = cli_args.aws_container_credentials_relative_uri {
+        tracing::info!("Using AWS credentials from auth provider: {path}");
+        aws::Credentials::from_url_path(path).map(Some)
+    } else if let Some(ref url) = cli_args.aws_container_credentials_full_uri {
+        tracing::info!("Using AWS credentials from auth provider: {url}");
+        aws::Credentials::from_url(url).map(Some)
+    } else if cli_args.aws_access_key_id.is_some() && cli_args.aws_secret_access_key.is_some() {
+        tracing::info!("Using provided AWS IAM credentials.");
+        aws::CredentialsBuilder::default()
+            .access_key_id(cli_args.aws_access_key_id.clone().unwrap())
+            .secret_access_key(cli_args.aws_secret_access_key.clone().unwrap())
+            .build()
+            .map(Some)
+    } else {
+        Ok(None)
     }
 }
 
-fn unmask_signals(signal_config: &SignalConfig) -> Result<()> {
-    tracing::info!("Unmasking signals.");
-
-    signal::sigprocmask(
-        signal::SigmaskHow::SIG_SETMASK,
-        Some(&signal_config.source_signals),
-        None,
-    )
-    .map_err(|err| {
-        tracing::error!("Failure configuring signals -- {err}");
-        err
-    })?;
-
-    unsafe {
-        signal::sigaction(signal::SIGTTIN, &signal_config.sigttin_action)?;
-        signal::sigaction(signal::SIGTTOU, &signal_config.sigttou_action)?;
+#[tracing::instrument(skip_all)]
+fn find_vault_settings(
+    cli_args: &CliArgs,
+    aws_client: Option<&AwsClient>,
+) -> BiminiResult<Option<vault::Settings>> {
+    if cli_args.vault_token.is_none() && aws_client.is_none() {
+        return Err(BiminiError::VaultCreds(
+            "Either a vault token or AWS credentials are required.".to_string(),
+        ));
     }
 
-    Ok(())
-}
+    let mut settings = vault::SettingsBuilder::default()
+        .address(cli_args.vault_addr.clone().unwrap())
+        .token(cli_args.vault_token.as_ref().cloned())
+        .cacert(cli_args.vault_cacert.as_ref().cloned())
+        .capath(cli_args.vault_capath.as_ref().cloned())
+        .client_cert(cli_args.vault_client_cert.as_ref().cloned())
+        .client_key(cli_args.vault_client_key.as_ref().cloned())
+        .client_timeout(cli_args.vault_client_timeout.unwrap())
+        .security_header(cli_args.vault_security_header.as_ref().cloned())
+        .build()?;
 
-fn isolate_child() -> Result<()> {
-    tracing::info!("Isolating child process in a new process group.");
-
-    let zero_pid = unistd::Pid::from_raw(0);
-    if let Err(errno) = unistd::setpgid(zero_pid, zero_pid) {
-        tracing::error!("setpgid failed {}", errno.desc());
-        return Err(errno.into());
+    if settings.token.is_none() {
+        tracing::info!("Not Vault token found, authenticating to Vault via AWS Credentials.");
+        let client = VaultClient::from(settings.clone());
+        let auth = client.activate::<AwsIamAuthEngine>("auth");
+        let login_response = auth.login(
+            cli_args.vault_role.as_ref().unwrap(),
+            aws_client.as_ref().unwrap(),
+        )?;
+        settings.token = login_response.auth.map(|auth| auth.client_token);
     }
 
-    match unistd::tcsetpgrp(libc::STDIN_FILENO, unistd::getpgrp()) {
-        Err(errno::Errno::ENOTTY | errno::Errno::ENXIO) => {
-            tracing::debug!("tcsetpgrp failed safely, continuing.");
-            Ok(())
-        }
-
-        Err(errno) => {
-            tracing::error!("tcsetpgrp failed {}", errno.desc());
-            Err(errno.into())
-        }
-
-        _ => Ok(()),
-    }
+    Ok(Some(settings))
 }
 
-pub fn resolve_vault_env_keys(
-    vault_client: &VaultClient,
-    env: env::Vars,
-) -> HashMap<String, String> {
-    let mut vault_cache = HashMap::<String, Option<Kv2GetResponse>>::new();
+#[tracing::instrument(skip_all)]
+fn generate_vault_certs(
+    vault_client: Option<&VaultClient>,
+    pki_engine_mount: &str,
+    vault_role: Option<&String>,
+    request: Option<&String>,
+) -> BiminiResult<()> {
+    let vault_pki = vault_client
+        .as_ref()
+        .map(|vc| vc.activate::<PkiEngine>(pki_engine_mount))
+        .ok_or(BiminiError::CertGeneration(
+            "Missing vault pki engine".to_string(),
+        ))?;
 
-    env.filter(|(_, val)| val.starts_with("vault:") && val.matches(':').count() == 3)
-        .map(|(env_key, val)| {
-            (
-                String::from(&env_key), //
-                {
-                    let fields: Vec<&str> = val.split(':').collect();
-                    let (_, engine, path, key) = (fields[0], fields[1], fields[2], fields[3]);
+    let request_json = request
+        .map(|r| serde_json::from_str::<PkiIssueRequest>(r))
+        .ok_or(BiminiError::CertGeneration(
+            "Missing vault pki request".to_string(),
+        ))??;
 
-                    let cache_page = vault_cache
-                        .entry(format!("{engine}:{path}"))
-                        .or_insert_with(|| vault_client.kv2_get(engine, path, None).ok());
-
-                    cache_page
-                        .as_ref()
-                        .and_then(|json| json.data.data.get(key).map(String::from))
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "Failed to resolve Hashicorp Vault ENV - Key: {env_key} Value: {val}"
-                            );
-                            String::from(&val)
-                        })
-                },
-            )
-        })
-        .collect()
-}
-
-fn spawn(
-    signal_config: &SignalConfig,
-    aws_client: &Option<AwsClient>,
-    aws_credentials_env_injection_disabled: bool,
-    vault_client: &Option<VaultClient>,
-    userspec: Option<String>,
-    spawn_directory: Option<String>,
-    command: String,
-    args: &Vec<String>,
-) -> Result<unistd::Pid> {
-    match unsafe { unistd::fork() } {
-        Ok(unistd::ForkResult::Child) => {
-            let mut proc = process::Command::new(&command);
-
-            proc.args(args);
-            proc.envs(env::vars().collect::<HashMap<String, String>>());
-
-            if let Some(vault_client) = vault_client {
-                tracing::info!("Resolving Hashicorp Vault keys in ENV.");
-                proc.envs(resolve_vault_env_keys(vault_client, env::vars()));
-            }
-
-            if let (false, Some(aws_client)) = (aws_credentials_env_injection_disabled, aws_client)
-            {
-                tracing::info!("Injecting AWS credentials into ENV.");
-                proc.envs(aws_client.as_envs());
-            }
-
-            let user_spec = userspec
-                .map(|s| UserSpec::from_str(&s))
-                .transpose()?
-                .unwrap_or_default();
-
-            tracing::info!("Switching execution context UID:GID to {user_spec}");
-            proc.envs(user_spec.switch_user()?);
-
-            tracing::info!("Switching current working directory.");
-            let spawn_directory = SpawnDirectory::new(spawn_directory)?;
-            proc.envs(spawn_directory.switch_directory()?);
-
-            isolate_child()?;
-
-            unmask_signals(signal_config)?;
-
-            tracing::info!("Handing execution off to child proc: {command}");
-            let error = proc.exec();
-
-            tracing::error!("execvp of '{command}' failed: {error}");
-            if let Some(errno) = error.raw_os_error() {
-                process::exit(errno);
-            }
-
-            Err(error.into())
-        }
-
-        Ok(unistd::ForkResult::Parent { child }) => {
-            tracing::info!("Spawning child proc: {child}");
-            Ok(child)
-        }
-
-        Err(errno) => {
-            tracing::error!("fork failed: {}", errno.desc());
-            Err(errno.into())
-        }
-    }
-}
-
-fn reap_zombies(child_pid: unistd::Pid) -> Result<i32> {
-    tracing::trace!("Reaping zombie procs.");
-
-    let any_proc = unistd::Pid::from_raw(-1);
-    let mut child_exitcode = -1;
-
-    loop {
-        match wait::waitpid(any_proc, Some(wait::WaitPidFlag::WNOHANG)) {
-            Ok(wait::WaitStatus::StillAlive) => {
-                tracing::trace!("No child to reap.");
-                break;
-            }
-
-            Ok(wait::WaitStatus::Exited(pid, status)) if pid == child_pid => {
-                tracing::info!("Main child exited normally with status: {status}");
-                child_exitcode = status;
-            }
-
-            Ok(wait::WaitStatus::Signaled(pid, signal, _)) if pid == child_pid => {
-                tracing::info!("Main child exited with signal: {}", signal.to_string());
-                child_exitcode = 128 + signal as i32;
-            }
-
-            Ok(wait::WaitStatus::Exited(pid, _)) => {
-                tracing::debug!("Reaped child with pid: {pid}");
-                if pid == child_pid {
-                    tracing::error!("Main child exited for an unknown reason.");
-                    // Unknown error
-                    return Err(errno::Errno::from_i32(42).into());
-                }
-            }
-
-            Ok(_) => todo!(),
-
-            Err(nix::Error::ECHILD) => {
-                tracing::trace!("No child to wait.");
-                break;
-            }
-
-            Err(errno) => {
-                tracing::error!("Error while waiting for pids: {}", errno.desc());
-                return Err(anyhow::Error::from(errno));
-            }
-        }
-    }
-
-    Ok(child_exitcode)
-}
-
-fn sigtimedwait(parent_signals: &signal::SigSet) -> Result<libc::siginfo_t, errno::Errno> {
-    let mut siginfo = std::mem::MaybeUninit::uninit();
-    let result = unsafe {
-        libc::sigtimedwait(
-            parent_signals.as_ref(),
-            siginfo.as_mut_ptr(),
-            SIG_TIMED_WAIT_TS.as_ref(),
-        )
-    };
-
-    errno::Errno::result(result)?;
-    Ok(unsafe { siginfo.assume_init() })
-}
-
-fn forward_signals(parent_signals: &signal::SigSet, child_pid: unistd::Pid) -> Result<()> {
-    tracing::trace!("Forwarding signals from {PKG_NAME} to child proc.");
-
-    match sigtimedwait(parent_signals) {
-        Err(errno @ errno::Errno::EAGAIN | errno @ errno::Errno::EINTR) => {
-            tracing::info!("Expected error, passing: {}", errno.desc());
-        }
-
-        Err(errno) => {
-            tracing::error!("Unexpected error in sigtimedwait: {}", errno.desc());
-            return Err(errno.into());
-        }
-
-        Ok(siginfo) => match signal::Signal::try_from(siginfo.si_signo) {
-            Ok(signal::SIGCHLD) => tracing::debug!("Received SIGCHLD"),
-            Ok(signal) => {
-                tracing::debug!("Passing signal: {}", signal.to_string());
-
-                signal::kill(child_pid, signal).map_err(|errno| {
-                    if errno == errno::Errno::ESRCH {
-                        tracing::warn!("Child was dead when forwarding signal");
-                    }
-                    anyhow::Error::from(errno)
-                })?;
-            }
-
-            Err(errno) => {
-                tracing::error!("{}", errno.desc());
-                return Err(errno.into());
-            }
-        },
-    }
-
-    Ok(())
-}
-
-fn generate_cert(
-    vault_client: &VaultClient,
-    engine: &str,
-    role: &str,
-    request_json: &str,
-) -> Result<()> {
-    let request = serde_json::from_str::<PkiIssueRequest>(request_json)?;
-    let response = vault_client.pki_issue(engine, role, &request)?;
-
-    let ssl_path = std::path::Path::new("/opt").join(PKG_NAME).join("ssl");
-    let ssl_private_path = ssl_path.join("private");
-    let ssl_certs_path = ssl_path.join("certs");
-
-    std::fs::create_dir_all(&ssl_path)?;
-    std::fs::create_dir_all(&ssl_private_path)?;
-    std::fs::create_dir_all(&ssl_certs_path)?;
-
-    let key_format = &request
-        .private_key_format
-        .unwrap_or_else(|| String::from("der"));
-    let cert_format = &request.format.unwrap_or_else(|| String::from("pem"));
-
-    tracing::warn!("Creating private key");
-    let mut ssl_private_key_path = ssl_private_path.join("key");
-    ssl_private_key_path.set_extension(&key_format);
-    std::fs::write(
-        &ssl_private_key_path,
-        format!("{}\n", &response.data.private_key),
-    )?;
-
-    tracing::warn!("Creating certificate");
-    let mut ssl_cert_path = ssl_certs_path.join("certificate");
-    ssl_cert_path.set_extension(&cert_format);
-    std::fs::write(&ssl_cert_path, format!("{}\n", &response.data.certificate))?;
-
-    tracing::warn!("Creating issuing-ca");
-    let mut ssl_ca_cert_path = ssl_certs_path.join("issuing-ca");
-    ssl_ca_cert_path.set_extension(&cert_format);
-    std::fs::write(
-        &ssl_ca_cert_path,
-        format!("{}\n", &response.data.certificate),
-    )?;
-
-    tracing::warn!("Creating ca-chain");
-    let mut ssl_ca_chain_path = ssl_certs_path.join("ca-chain");
-    ssl_ca_chain_path.set_extension(&cert_format);
-    std::fs::write(
-        &ssl_ca_chain_path,
-        format!("{}\n", &response.data.ca_chain.join("\n")),
+    vault_pki.generate_cert(
+        vault_role.ok_or(BiminiError::CertGeneration(
+            "Missing vault role".to_string(),
+        ))?,
+        &request_json,
     )?;
 
     Ok(())
 }
 
-fn main() -> Result<process::ExitCode> {
+fn main() -> BiminiResult<process::ExitCode> {
     let cli_args = CliArgs::parse();
 
-    // Set up tracing
-    let subscriber_builder = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_new(cli_args.log_level).context("Invalid log level")?,
+    let trace_formatter = tracing_subscriber::fmt::layer()
+        .with_level(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    let registry = tracing_subscriber::Registry::default().with(
+        tracing_subscriber::filter::EnvFilter::new(&cli_args.log_level),
     );
 
     match cli_args.log_format.as_str() {
-        "json" => subscriber_builder.json().init(),
-        "pretty" => subscriber_builder.pretty().init(),
-        _ => subscriber_builder.init(),
+        "json" => registry.with(trace_formatter.json()).init(),
+        "pretty" => registry.with(trace_formatter.pretty()).init(),
+        _ => registry.with(trace_formatter.compact()).init(),
     };
 
-    let aws_creds = if cli_args.aws_client_disabled {
-        None
-    } else if let (Some(access_key), Some(secret_key)) =
-        (cli_args.aws_access_key_id, cli_args.aws_secret_access_key)
-    {
-        tracing::info!("Using provided AWS IAM credentials.");
-        Some(
-            AwsCredentials::new()
-                .access_key_id(access_key)
-                .secret_access_key(secret_key)
-                .token(cli_args.aws_session_token)
-                .build(),
-        )
-    } else if cli_args.aws_container_credentials_relative_uri.is_some()
-        || cli_args.aws_container_credentials_full_uri.is_some()
-    {
-        tracing::info!("Loading AWS IAM credentials from container identity service.");
-        if let Some(creds) = AwsCredentials::from_container_credential_env_vars(
-            cli_args.aws_container_credentials_relative_uri,
-            cli_args.aws_container_credentials_full_uri,
-        ) {
-            Some(creds?)
-        } else {
-            None
-        }
+    let aws_credentials = if cli_args.aws_client_enabled {
+        tracing::info!("AWS Client enabled, searching for credentials.");
+        find_aws_credentials(&cli_args)?
     } else {
+        tracing::info!("AWS Client disabled, skipping credential search.");
         None
     };
 
-    let mut aws_client = match aws_creds {
-        Some(aws_creds) => {
-            tracing::info!("Building AWS API Client.");
+    let aws_client = aws_credentials.map(|credentials| {
+        AwsClient::from(credentials).with_region(cli_args.aws_region.as_ref().unwrap())
+    });
 
-            let mut aws_client = AwsClient::from(aws_creds);
-            aws_client.region(
-                cli_args
-                    .aws_region
-                    .unwrap_or_else(|| String::from("us-east-1")),
-            );
-            Some(aws_client)
-        }
-        _ => None,
-    };
-
-    // Build Hashicorp Vault client
-    let mut vault_client = if cli_args.vault_client_disabled {
-        None
+    let vault_settings = if cli_args.vault_client_enabled {
+        tracing::info!("Vault Client enabled, building for settings.");
+        find_vault_settings(&cli_args, aws_client.as_ref())?
     } else {
-        tracing::info!("Building Hashicorp Vault client.");
-
-        let vault_addr = url::Url::parse(&cli_args.vault_addr.unwrap_or_else(|| {
-            tracing::error!("VAULT_ADDR required for Hashicorp Vault client integration.");
-            process::exit(1);
-        }))
-        .map_err(|parse_error| {
-            tracing::error!("VAULT_ADDR has an invalid value - {parse_error}");
-            parse_error
-        })?;
-
-        Some(
-            VaultClient::new()
-                .address(vault_addr)
-                .security_header(cli_args.vault_security_header)
-                .token(cli_args.vault_token)
-                .build(),
-        )
+        tracing::info!("Vault Client disabled, skipping settings search.");
+        None
     };
 
-    (vault_client, aws_client) = match (vault_client, aws_client) {
-        (Some(mut vault_client), Some(aws_client)) => {
-            if let Some(vault_role) = cli_args.vault_role {
-                vault_client.auth_aws_login(&vault_role, &aws_client)?;
-            } else {
-                tracing::error!("VAULT_ROLE required for vault / aws login.");
-                process::exit(1);
-            }
-            (Some(vault_client), Some(aws_client))
-        }
-        (Some(vault_client), None) if vault_client.token.is_none() => {
-            tracing::error!("Either a vault token or AWS credentials are required.");
-            process::exit(1);
-        }
-        (vault_client, aws_client) => (vault_client, aws_client),
-    };
+    let vault_client = vault_settings.map(VaultClient::from);
 
-    if !cli_args.vault_cert_generation_disabled {
-        if let (Some(vault_client), Some(role), Some(request_json)) = (
-            &vault_client,
-            cli_args.vault_cert_role,
-            cli_args.vault_cert_request,
-        ) {
-            tracing::info!("Generating client certificates.");
-            if let Err(err) = generate_cert(
-                vault_client,
-                &cli_args.vault_cert_engine,
-                &role,
-                &request_json,
-            ) {
-                tracing::error!("Failed to generate vault issued certs - {err}");
-                process::exit(1);
-            }
-        } else {
-            tracing::error!(
-                "Hashicorp Vault cert generation requires vault credentials and a Cert role."
-            );
-            process::exit(1);
-        }
+    if cli_args.vault_cert_generation_enabled {
+        tracing::info!("Vault cert generation enabled, starting generation.");
+        generate_vault_certs(
+            vault_client.as_ref(),
+            cli_args.vault_cert_engine.as_str(),
+            cli_args.vault_cert_role.as_ref(),
+            cli_args.vault_cert_request.as_ref(),
+        )?;
+    } else {
+        tracing::info!("Vault cert generation disabled, skipping generation.");
     }
 
-    // Mask signals
-    let signal_config = match mask_signals() {
-        Ok(sigset) => sigset,
-        Err(err) => {
-            tracing::error!("Failure configuring signals: {err}");
-            return Err(err);
-        }
-    };
-
-    // Spawn proc
-    let child_pid = spawn(
-        &signal_config,
-        &aws_client,
-        cli_args.aws_credentials_env_injection_disabled,
-        &vault_client,
-        cli_args.spawn_userspec,
-        cli_args.spawn_directory,
-        cli_args.command,
-        &cli_args.args,
-    )?;
-
-    // Management loop
-    loop {
-        forward_signals(&signal_config.parent_signals, child_pid)?;
-
-        let child_exitcode = reap_zombies(child_pid)?;
-
-        if child_exitcode != -1 {
-            process::exit(child_exitcode);
-        }
-    }
+    tracing::info!("Starting process controller.");
+    proc::Controller::default()
+        .mask_signals()?
+        .spawn(
+            proc::ChildBuilder::default()
+                .command(cli_args.command)
+                .args(cli_args.args)
+                .user_spec(
+                    cli_args
+                        .spawn_userspec
+                        .map(|s| UserSpec::from_str(s.as_str()))
+                        .transpose()?,
+                )
+                .aws_client(if cli_args.aws_credentials_env_injection_enabled {
+                    aws_client
+                } else {
+                    None
+                })
+                .vault_client(vault_client),
+        )?
+        .start_signal_forwarder()?
+        .run_reaper()
 }
