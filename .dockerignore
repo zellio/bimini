@@ -2,4 +2,4 @@
 .github/
 Dockerfile
 README.md
-target/
+**/target/

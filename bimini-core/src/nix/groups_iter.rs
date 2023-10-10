@@ -22,14 +22,15 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use libc;
 use nix::{errno, unistd, Result};
+
+#[cfg(target_env = "gnu")]
 use std::{mem, ptr};
 
 #[derive(Debug)]
-pub struct AllGroups;
+pub struct GroupsIter;
 
-impl Iterator for AllGroups {
+impl Iterator for GroupsIter {
     type Item = Result<unistd::Group>;
 
     #[cfg(target_env = "gnu")]
@@ -80,7 +81,7 @@ impl Iterator for AllGroups {
     }
 }
 
-impl Drop for AllGroups {
+impl Drop for GroupsIter {
     fn drop(&mut self) {
         unsafe { libc::endgrent() };
     }
