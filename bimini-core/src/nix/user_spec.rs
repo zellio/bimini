@@ -18,6 +18,8 @@ impl UserSpec {
         let current_userspec = UserSpec::default();
 
         if let Some(group) = &self.group {
+            tracing::info!("Switching to group {}", group.name);
+
             unistd::setgid(group.gid).map_err(|errno| {
                 tracing::error!("Failed to set GID to {} - {errno}", group.gid);
                 errno
@@ -30,6 +32,8 @@ impl UserSpec {
             group: Some(_group),
         } = &self
         {
+            tracing::info!("Setting secondary user groups");
+
             let gids = GroupsIter
                 .filter_map(|group| match group {
                     Ok(group) if group.mem.contains(&user.name) => Some(group.gid),
@@ -41,6 +45,8 @@ impl UserSpec {
         }
 
         if let Some(user) = &self.user {
+            tracing::info!("Switching to user {}", user.name);
+
             unistd::setuid(user.uid).map_err(|errno| {
                 tracing::error!("Failed to set UID to {} - {errno}", user.uid);
                 errno
@@ -86,18 +92,34 @@ impl std::fmt::Display for UserSpec {
     }
 }
 
+fn resolve_user(s: &str) -> Result<Option<unistd::User>, errno::Errno> {
+    if let Ok(uid) = s.parse::<u32>() {
+        unistd::User::from_uid(unistd::Uid::from_raw(uid))
+    } else {
+        unistd::User::from_name(s)
+    }
+}
+
+fn resolve_group(s: &str) -> Result<Option<unistd::Group>, errno::Errno> {
+    if let Ok(uid) = s.parse::<u32>() {
+        unistd::Group::from_gid(unistd::Gid::from_raw(uid))
+    } else {
+        unistd::Group::from_name(s)
+    }
+}
+
 impl FromStr for UserSpec {
     type Err = errno::Errno;
 
     #[tracing::instrument(skip_all)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let tokens = s.split(':').collect::<Vec<&str>>();
+        let (user_str, group_str) = s.split_once(':').unwrap_or((s, ""));
 
-        let user = if let Some(user_name) = tokens.first() {
-            let user = unistd::User::from_name(user_name)?;
+        let user = if !user_str.is_empty() {
+            let user = resolve_user(user_str)?;
 
-            if user.is_none() && !user_name.is_empty() {
-                tracing::warn!("Failed to resolve user name: {user_name}");
+            if user.is_none() {
+                tracing::warn!("Failed to resolve user: {user_str}");
             }
 
             user
@@ -105,11 +127,11 @@ impl FromStr for UserSpec {
             None
         };
 
-        let group = if let Some(group_name) = tokens.get(1) {
-            let group = unistd::Group::from_name(group_name)?;
+        let group = if !group_str.is_empty() {
+            let group = resolve_group(group_str)?;
 
-            if group.is_none() && !group_name.is_empty() {
-                tracing::warn!("Failed to resolve group name: {group_name}");
+            if group.is_none() {
+                tracing::warn!("Failed to resolve group: {group_str}");
             }
 
             group

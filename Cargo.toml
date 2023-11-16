@@ -1,6 +1,6 @@
 [package]
 name = "bimini"
-version = "0.1.0"
+version = "0.11.0"
 edition = "2021"
 
 [profile.release]
@@ -10,9 +10,9 @@ opt-level = 'z'
 
 [dependencies]
 bimini-core = { path = "bimini-core" }
-clap = { version = "4.4.4", features = ["env", "derive"] }
+clap = { version = "4.4.8", features = ["env", "derive", "unicode"] }
 serde = { version = "1.0.188", features = ["serde_derive"] }
 serde_json = "1.0.107"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["json", "env-filter"] }
-url = "2.4.1"
+url = { version = "2.4.1", features = ["serde"] }

@@ -2,10 +2,7 @@ use crate::{
     aws::AwsClient,
     error::{BiminiError, BiminiResult},
     nix::{SignalConfig, SpawnDirectory, ToEnv, UserSpec},
-    vault::{
-        engine::{Engine, Kv2Engine, Kv2ReadResponse},
-        Client, VaultClient,
-    },
+    vault::VaultClient,
 };
 use derive_builder::Builder;
 use nix::{errno, unistd};
@@ -14,6 +11,8 @@ use std::{collections::HashMap, env, os::unix::process::CommandExt, process};
 #[derive(Builder)]
 #[builder(build_fn(error = "BiminiError"), pattern = "owned")]
 pub struct Child<'a> {
+    signal_config: &'a mut SignalConfig,
+
     #[builder(default)]
     user_spec: Option<UserSpec>,
 
@@ -29,8 +28,6 @@ pub struct Child<'a> {
     command: String,
 
     args: Vec<String>,
-
-    signal_config: &'a mut SignalConfig,
 }
 
 impl<'a> Child<'a> {
@@ -53,74 +50,34 @@ impl<'a> Child<'a> {
     }
 
     #[tracing::instrument(skip_all)]
-    fn vault_resolved_env(&self) -> HashMap<String, String> {
-        tracing::info!("Resolving vault environment keys.");
-
-        let mut engine_cache = HashMap::<String, Kv2Engine>::default();
-        let mut page_cache = HashMap::<(String, String), Option<Kv2ReadResponse>>::default();
-
-        env::vars()
-            .filter(|(_, value)| value.starts_with("vault:") && value.matches(':').count() == 3)
-            .map(|(name, value)| {
-                (name, {
-                    let fields: Vec<&str> = value.split(':').collect();
-                    let (_, engine, path, key) = (fields[0], fields[1], fields[2], fields[3]);
-
-                    let client = engine_cache.entry(engine.to_string()).or_insert_with(|| {
-                        self.vault_client
-                            .as_ref()
-                            .unwrap()
-                            .activate(engine.to_string())
-                    });
-
-                    let page = page_cache
-                        .entry((engine.to_string(), path.to_string()))
-                        .or_insert_with(|| client.get(path).map(|response| response.data).ok());
-
-                    page.as_ref()
-                        .and_then(|page| page.data.get(key))
-                        .map_or_else(
-                            || {
-                                tracing::warn!(
-                                    "Failed to resolve Hashicorp Vault ENV - Key: {key} Value: {value}"
-                                );
-                                String::from(&value)
-                            },
-                            String::from,
-                        )
-                })
-            })
-            .collect()
-    }
-
-    #[tracing::instrument(skip_all)]
     pub fn spawn(&mut self) -> BiminiResult<unistd::Pid> {
         tracing::info!("Constructing child proc for spawnning.");
 
         let mut proc = process::Command::new(&self.command);
+
         proc.args(&self.args);
 
         proc.envs(env::vars());
-
-        if let Some(vault_client) = &self.vault_client {
-            tracing::debug!("Vault client provided, resolving env keys.");
-            proc.envs(vault_client.to_env());
-            proc.envs(self.vault_resolved_env());
-        }
+        proc.envs(self.to_env());
 
         if let Some(aws_client) = &self.aws_client {
-            tracing::debug!("AWS Client provided, injecting environment.");
+            tracing::debug!("AWS Client provided, injecting environment");
             proc.envs(aws_client.to_env());
         }
 
+        if let Some(vault_client) = &self.vault_client {
+            tracing::debug!("Vault client provided, resolving env keys");
+            proc.envs(vault_client.to_env());
+        }
+
         if let Some(user_spec) = &self.user_spec {
-            tracing::debug!("UserSpec provided, switching executing user.");
+            tracing::debug!("UserSpec provided, switching executing user");
             user_spec.switch_user()?;
             proc.envs(user_spec.to_env());
         }
 
         if let Some(spawn_directory) = &self.spawn_directory {
-            tracing::debug!("Spawn directory provided, changing proc root.");
+            tracing::debug!("Spawn directory provided, changing proc root");
             spawn_directory.chdir()?;
             proc.envs(spawn_directory.to_env());
         }
@@ -135,5 +92,21 @@ impl<'a> Child<'a> {
         }
 
         Err(BiminiError::from(error))
+    }
+}
+
+impl<'a> ToEnv for Child<'a> {
+    fn to_env(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (String::from("BIMINI"), String::from("true")),
+            (
+                String::from("BIMINI_VERSION"),
+                String::from(env!("CARGO_PKG_VERSION")),
+            ),
+            (
+                String::from("BIMINI_CHILD_PID"),
+                format!("{}", unistd::getpid()),
+            ),
+        ])
     }
 }

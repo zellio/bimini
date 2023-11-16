@@ -5,20 +5,20 @@ use std::{error, fmt};
 pub enum BiminiError {
     AwsSigBuild(aws_sigv4::signing_params::BuildError),
     Builder(derive_builder::UninitializedFieldError),
+    CertGeneration(String),
     Env(std::env::VarError),
     Errno(nix::errno::Errno),
     HttpError(http::Error),
     Io(std::io::Error),
     Json(serde_json::Error),
+    ProcController(String),
+    ThreadJoin(Box<dyn std::any::Any + Send>),
+    TryFromIntError(std::num::TryFromIntError),
     Unknown(String),
     UreqError(Box<ureq::Error>),
     UrlParseError(url::ParseError),
     Utf8Error(core::str::Utf8Error),
-    ProcController(String),
-    TryFromIntError(std::num::TryFromIntError),
-    ThreadJoin(Box<dyn std::any::Any + Send>),
     VaultCreds(String),
-    CertGeneration(String),
 }
 
 impl error::Error for BiminiError {}
@@ -26,10 +26,9 @@ impl error::Error for BiminiError {}
 impl fmt::Display for BiminiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CertGeneration(msg) => write!(f, "Vault cert generation error: {msg}"),
-            Self::VaultCreds(msg) => write!(f, "Vault credentials error: {msg}"),
             Self::AwsSigBuild(err) => write!(f, "Failed construting aws sig: {err}"),
             Self::Builder(err) => write!(f, "Derived builder failure: {err}"),
+            Self::CertGeneration(msg) => write!(f, "Vault cert generation error: {msg}"),
             Self::Env(err) => write!(f, "Env var lookup error: {err}"),
             Self::Errno(err) => write!(f, "{err}"),
             Self::HttpError(err) => write!(f, "Http Encoding error: {err}"),
@@ -42,6 +41,7 @@ impl fmt::Display for BiminiError {
             Self::UreqError(err) => write!(f, "uReq error: {err}"),
             Self::UrlParseError(err) => write!(f, "URL Parser error: {err}"),
             Self::Utf8Error(err) => write!(f, "UTF8 encdoing error: {err}"),
+            Self::VaultCreds(msg) => write!(f, "Vault credentials error: {msg}"),
         }
     }
 }

@@ -67,8 +67,48 @@ impl Client for VaultClient {
 }
 
 impl ToEnv for VaultClient {
+    #[tracing::instrument(skip_all)]
     fn to_env(&self) -> HashMap<String, String> {
-        self.settings().to_env()
+        tracing::info!("Resolving vault environment keys");
+
+        let mut engine_cache = HashMap::<String, super::engine::Kv2Engine>::default();
+        let mut page_cache =
+            HashMap::<(String, String), Option<super::engine::Kv2ReadResponse>>::default();
+
+        let mut env = self.settings().to_env();
+
+        env.extend(
+            std::env::vars()
+                .filter(|(_, value)| value.starts_with("vault:") && value.matches(':').count() == 3)
+                .map(|(name, value)| {
+                    (name, {
+                        let fields: Vec<&str> = value.split(':').collect();
+                        let (_, engine, path, key) = (fields[0], fields[1], fields[2], fields[3]);
+
+                        let client = engine_cache
+                            .entry(engine.to_string())
+                            .or_insert_with(|| self.activate(engine.to_string()));
+
+                        let page = page_cache
+                            .entry((engine.to_string(), path.to_string()))
+                            .or_insert_with(|| client.get(path).map(|response| response.data).ok());
+
+                        page.as_ref()
+                            .and_then(|page| page.data.get(key))
+                            .map_or_else(
+                                || {
+                                    tracing::warn!(
+                                "Failed to resolve Hashicorp Vault ENV - Key: {key} Value: {value}"
+                            );
+                                    String::from(&value)
+                                },
+                                String::from,
+                            )
+                    })
+                }),
+        );
+
+        env
     }
 }
 
