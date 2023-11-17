@@ -10,7 +10,7 @@ use bimini_core::{
     },
 };
 use clap::{builder::ArgPredicate, Parser};
-use std::{process, str::FromStr};
+use std::{path::PathBuf, process, str::FromStr};
 use tracing_subscriber::{filter::LevelFilter, prelude::*, Registry};
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -75,7 +75,7 @@ struct CliArgs {
         long("spawn-directory"),
         env("BIMINI_SPAWN_DIRECTORY")
     )]
-    spawn_directory: Option<String>,
+    spawn_directory: Option<PathBuf>,
 
     /// Enable Amazon Web Services client.
     #[clap(
@@ -216,7 +216,6 @@ struct CliArgs {
         long,
         env,
         groups(["vault-creds-provider"]),
-        requires("enable_aws_client"),
         requires("vault_addr")
     )]
     vault_role: Option<String>,
@@ -477,6 +476,7 @@ fn main() -> BiminiResult<process::ExitCode> {
                         .map(|s| UserSpec::from_str(s.as_str()))
                         .transpose()?,
                 )
+                .spawn_directory(cli_args.spawn_directory)
                 .aws_client(if cli_args.enable_aws_creds_env_injection {
                     aws_client
                 } else {

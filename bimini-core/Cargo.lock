@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "bimini-core"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "aws-sigv4",
  "base64",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "bimini-macros"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "proc-macro2",
  "quote",

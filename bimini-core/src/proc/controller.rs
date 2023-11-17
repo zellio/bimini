@@ -8,20 +8,12 @@ use nix::{
     sys::{signal, wait},
     unistd,
 };
-use std::{
-    process::ExitCode,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-};
+use std::{process::ExitCode, thread};
 
 #[derive(Debug, Default)]
 pub struct Controller {
     signal_config: SignalConfig,
     child_pid: Option<unistd::Pid>,
-    sf_runlock: Arc<AtomicBool>,
     signal_forwarder: Option<std::thread::JoinHandle<BiminiResult<()>>>,
 }
 
@@ -61,34 +53,38 @@ impl Controller {
     }
 
     #[tracing::instrument(skip_all)]
-    fn signal_forwarder(
-        sf_runlock: Arc<AtomicBool>,
-        signal_config: SignalConfig,
-        child_pid: unistd::Pid,
-    ) -> BiminiResult<()> {
+    fn signal_forwarder(signal_config: SignalConfig, child_pid: unistd::Pid) -> BiminiResult<()> {
         tracing::info!("Starting signal forwarding event loop");
 
-        signal::pthread_sigmask(
-            signal::SigmaskHow::SIG_SETMASK,
-            Some(signal_config.source_signals()),
-            None,
-        )?;
+        loop {
+            let signal = signal_config.mask_wait();
 
-        while sf_runlock.load(Ordering::Relaxed) {
-            match signal_config.parent_signals().wait() {
-                Ok(signal) if sf_runlock.load(Ordering::Relaxed) => {
-                    tracing::info!("Passing signal to child: {signal}");
+            tracing::info!("Received Signal({signal:?}), dispatching");
 
-                    signal::kill(child_pid, signal).map_err(|eno| {
-                        if eno == errno::Errno::ESRCH {
-                            tracing::warn!("Child was dead when forwarding signal");
-                        }
-                        eno
-                    })?;
+            match signal {
+                Ok(signal::Signal::SIGCHLD) => {
+                    tracing::info!("Suppressing Signal(SIGCHLD)");
+                }
+
+                Ok(signal::Signal::SIGUSR1) => {
+                    tracing::info!("Terminating signal_forwarder loop.");
+                    return Ok(());
                 }
 
                 Ok(signal) => {
-                    tracing::trace!("Received signal {signal} after loop termination");
+                    tracing::info!("Passing Signal({signal}) to Child(pid={child_pid})");
+
+                    if let Err(errno) = signal::kill(child_pid, signal) {
+                        match errno {
+                            errno::Errno::ESRCH => tracing::warn!(
+                                "Child(pid={child_pid}) was dead when forwarding, Signal({signal}) dropped."
+                            ),
+                            errno => {
+                                tracing::error!("Received un-handled error passing signal to child: {errno}");
+                                return Err(BiminiError::Errno(errno))
+                            },
+                        }
+                    }
                 }
 
                 Err(errno @ errno::Errno::EAGAIN | errno @ errno::Errno::EINTR) => {
@@ -101,8 +97,6 @@ impl Controller {
                 }
             }
         }
-
-        Ok(())
     }
 
     #[tracing::instrument(skip_all)]
@@ -115,14 +109,11 @@ impl Controller {
             ));
         }
 
-        self.sf_runlock.store(true, Ordering::Release);
-
-        let runlock_clone = Arc::clone(&self.sf_runlock);
         let signal_config = self.signal_config.clone();
         let child_pid = self.child_pid.unwrap();
 
         self.signal_forwarder = Some(thread::spawn(move || {
-            Controller::signal_forwarder(runlock_clone, signal_config, child_pid)
+            Controller::signal_forwarder(signal_config, child_pid)
         }));
 
         Ok(self)
@@ -146,7 +137,7 @@ impl Controller {
             match wait::waitpid(any_proc, None) {
                 Ok(wait::WaitStatus::Exited(pid, status)) if pid == child_pid => {
                     tracing::info!(
-                        "Controller child process {pid} exited normally with status {status}."
+                        "Controller child process Child(pid={pid}) exited normally with status {status}."
                     );
                     child_exitcode = status;
                 }
@@ -208,24 +199,22 @@ impl Controller {
     pub fn run_reaper(self) -> BiminiResult<ExitCode> {
         loop {
             tracing::debug!("Running zombie reaper loop.");
-
             let rc = self.reap_zombies()?;
 
-            if rc != -1 {
-                tracing::trace!("Received child status code: {rc}. Cleaning up");
-                if let Some(signal_forwarder) = self.signal_forwarder {
-                    tracing::trace!("Releasing signal_forwarding loop runlock");
-                    self.sf_runlock.store(false, Ordering::Release);
-
-                    tracing::trace!("Sending final SIGTERM to signal_forwarding thread");
-                    signal::kill(unistd::Pid::from_raw(0), signal::SIGTERM)?;
-
-                    tracing::trace!("Joining signal_forwarding thread");
-                    signal_forwarder.join()??;
-                }
-
-                return Ok(ExitCode::from(TryInto::<u8>::try_into(rc)?));
+            if rc == -1 {
+                continue;
             }
+
+            tracing::trace!("Received child status code: {rc}. Cleaning up");
+            if let Some(signal_forwarder) = self.signal_forwarder {
+                tracing::trace!("Sending termination signal to signal_forwarding thread");
+                signal::kill(unistd::getpid(), signal::SIGUSR1)?;
+
+                tracing::trace!("Joining signal_forwarding thread");
+                signal_forwarder.join()??;
+            }
+
+            return Ok(ExitCode::from(TryInto::<u8>::try_into(rc)?));
         }
     }
 }

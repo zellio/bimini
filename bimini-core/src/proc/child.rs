@@ -1,12 +1,13 @@
 use crate::{
     aws::AwsClient,
     error::{BiminiError, BiminiResult},
-    nix::{SignalConfig, SpawnDirectory, ToEnv, UserSpec},
+    nix::{SignalConfig, ToEnv, UserSpec},
+    proc::SpawnDirectory,
     vault::VaultClient,
 };
 use derive_builder::Builder;
 use nix::{errno, unistd};
-use std::{collections::HashMap, env, os::unix::process::CommandExt, process};
+use std::{collections::HashMap, env, os::unix::process::CommandExt, path::PathBuf, process};
 
 #[derive(Builder)]
 #[builder(build_fn(error = "BiminiError"), pattern = "owned")]
@@ -17,7 +18,7 @@ pub struct Child<'a> {
     user_spec: Option<UserSpec>,
 
     #[builder(default)]
-    spawn_directory: Option<SpawnDirectory>,
+    spawn_directory: Option<PathBuf>,
 
     #[builder(default)]
     aws_client: Option<AwsClient>,
@@ -76,15 +77,23 @@ impl<'a> Child<'a> {
             proc.envs(user_spec.to_env());
         }
 
-        if let Some(spawn_directory) = &self.spawn_directory {
-            tracing::debug!("Spawn directory provided, changing proc root");
-            spawn_directory.chdir()?;
-            proc.envs(spawn_directory.to_env());
-        }
+        tracing::trace!("Changing proc working directory");
+        let mut spawn_directory = SpawnDirectory::new(
+            self.spawn_directory.clone(),
+            self.user_spec
+                .as_ref()
+                .and_then(|user_spec| user_spec.user.clone()),
+        );
+        spawn_directory.chdir();
+        proc.envs(spawn_directory.to_env());
 
+        tracing::trace!("Creating a new proc group for child");
         self.isolate()?;
+
+        tracing::trace!("Clearing inherited sigmask");
         self.signal_config.unmask()?;
 
+        tracing::trace!("Execing child proc");
         let error = proc.exec();
 
         if let Some(errno) = error.raw_os_error() {
@@ -101,7 +110,7 @@ impl<'a> ToEnv for Child<'a> {
             (String::from("BIMINI"), String::from("true")),
             (
                 String::from("BIMINI_VERSION"),
-                String::from(env!("CARGO_PKG_VERSION")),
+                String::from(crate::PKG_VERSION),
             ),
             (
                 String::from("BIMINI_CHILD_PID"),

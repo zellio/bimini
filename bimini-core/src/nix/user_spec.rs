@@ -8,8 +8,8 @@ use crate::{error::BiminiResult, nix::ToEnv};
 
 #[derive(Clone, Debug)]
 pub struct UserSpec {
-    user: Option<unistd::User>,
-    group: Option<unistd::Group>,
+    pub user: Option<unistd::User>,
+    pub group: Option<unistd::Group>,
 }
 
 impl UserSpec {

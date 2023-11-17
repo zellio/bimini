@@ -1,36 +1,40 @@
-use nix::sys::signal;
-
 use crate::error::BiminiResult;
+use nix::{errno, sys::signal};
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct SignalConfig {
-    parent_signals: signal::SigSet,
-    source_signals: signal::SigSet,
+    mask_set: signal::SigSet,
+    source_set: signal::SigSet,
     sigttin_action: signal::SigAction,
     sigttou_action: signal::SigAction,
 }
 
+impl Default for SignalConfig {
+    fn default() -> Self {
+        Self::new(&[
+            // Un-blockable signals
+            signal::SIGKILL,
+            signal::SIGSTOP,
+            // Program signals
+            signal::SIGABRT,
+            signal::SIGBUS,
+            #[cfg(not(target_os = "linux"))]
+            signal::SIGEMT,
+            signal::SIGFPE,
+            signal::SIGILL,
+            signal::SIGIOT,
+            signal::SIGSEGV,
+            signal::SIGSYS,
+            signal::SIGTRAP,
+        ])
+    }
+}
+
 impl SignalConfig {
-    pub fn parent_signals(&self) -> &signal::SigSet {
-        &self.parent_signals
-    }
-
-    pub fn source_signals(&self) -> &signal::SigSet {
-        &self.source_signals
-    }
-
-    pub fn sigttin_action(&self) -> &signal::SigAction {
-        &self.sigttin_action
-    }
-
-    pub fn sigttou_action(&self) -> &signal::SigAction {
-        &self.sigttou_action
-    }
-
-    pub fn new(protected_signals: Vec<signal::Signal>) -> Self {
-        let mut parent_signals = signal::SigSet::all();
-        for signal in protected_signals {
-            parent_signals.remove(signal)
+    pub fn new(protected_signals: &[signal::Signal]) -> Self {
+        let mut mask = signal::SigSet::all();
+        for sig in protected_signals {
+            mask.remove(*sig);
         }
 
         let ignore_action = signal::SigAction::new(
@@ -39,19 +43,19 @@ impl SignalConfig {
             signal::SigSet::empty(),
         );
 
-        SignalConfig {
-            parent_signals,
-            source_signals: signal::SigSet::empty(),
+        Self {
+            mask_set: mask,
+            source_set: signal::SigSet::empty(),
             sigttin_action: ignore_action,
             sigttou_action: ignore_action,
         }
     }
 
-    pub fn mask(&mut self) -> BiminiResult<()> {
-        signal::sigprocmask(
+    pub fn mask(&mut self) -> BiminiResult<&mut Self> {
+        signal::pthread_sigmask(
             signal::SigmaskHow::SIG_SETMASK,
-            Some(&self.parent_signals),
-            Some(&mut self.source_signals),
+            Some(&self.mask_set),
+            Some(&mut self.source_set),
         )?;
 
         unsafe {
@@ -59,39 +63,29 @@ impl SignalConfig {
             self.sigttou_action = signal::sigaction(signal::SIGTTOU, &self.sigttou_action)?;
         }
 
-        Ok(())
+        Ok(self)
     }
 
-    pub fn unmask(&mut self) -> BiminiResult<()> {
-        signal::sigprocmask(
+    pub fn unmask(&mut self) -> BiminiResult<&mut Self> {
+        signal::pthread_sigmask(
             signal::SigmaskHow::SIG_SETMASK,
-            Some(&self.source_signals),
+            Some(&self.source_set),
             None,
         )?;
-
-        self.source_signals = signal::SigSet::empty();
 
         unsafe {
             signal::sigaction(signal::SIGTTIN, &self.sigttin_action)?;
             signal::sigaction(signal::SIGTTOU, &self.sigttou_action)?;
         }
 
-        Ok(())
+        Ok(self)
     }
-}
 
-impl Default for SignalConfig {
-    fn default() -> Self {
-        SignalConfig::new(vec![
-            signal::SIGFPE,
-            signal::SIGILL,
-            signal::SIGSEGV,
-            signal::SIGBUS,
-            signal::SIGABRT,
-            signal::SIGTRAP,
-            signal::SIGSYS,
-            signal::SIGTTIN,
-            signal::SIGTTOU,
-        ])
+    pub fn mask_wait(&self) -> Result<signal::Signal, errno::Errno> {
+        self.mask_set.wait()
+    }
+
+    pub fn source_wait(&self) -> Result<signal::Signal, errno::Errno> {
+        self.source_set.wait()
     }
 }
