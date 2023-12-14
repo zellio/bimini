@@ -133,7 +133,7 @@ struct CliArgs {
         help_heading("AWS Client"),
         long,
         env,
-        groups(["aws-cred-provider", "aws-env-provider"]),
+        groups(["aws-cred-provider"]),
         requires("aws_secret_access_key"),
     )]
     aws_access_key_id: Option<String>,
